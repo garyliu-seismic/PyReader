@@ -1,6 +1,8 @@
 # reader.py —— 基于 PySide6 的文本小说阅读器（支持大文件惰性分页）
 # 双击 start.bat 或命令行:  python reader.py 小说.txt
-import sys, json, re, os, threading, bisect, urllib.request, asyncio, time
+import sys, json, re, os, threading, bisect, urllib.request, asyncio, time, zipfile, posixpath, html
+from urllib.parse import unquote
+import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional
 
 from PySide6.QtCore import Qt, QRectF, QSizeF, QPointF, Signal, QObject, QTimer, QEvent, QBuffer, QByteArray, QIODevice
@@ -196,25 +198,114 @@ def decode_text(raw: bytes) -> str:
             best_text, best_count = t, c
     return best_text
 
+# ============ epub / HTML 解析（标准库，零依赖） ============
+def _strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+def _html_to_text(raw: bytes):
+    """XHTML/HTML → (纯文本, 标题)。标题取第一个 h1-h6。"""
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        s = raw.decode("utf-8", errors="replace")
+    # 去掉 script/style 块
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", s)
+    # 标题
+    title = ""
+    m = re.search(r"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>", s)
+    if m:
+        title = html.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(1))).strip()
+    # 块级元素 → 换行
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|h[1-6]|li|tr|blockquote)>", "\n", s)
+    # 去所有标签
+    s = re.sub(r"(?s)<[^>]+>", "", s)
+    s = html.unescape(s)
+    # 压缩空白
+    s = re.sub(r"[ \t\r]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n\n", s)
+    return s.strip(), title
+
+def load_epub(path):
+    """解析 epub：返回 (全文, 章节[(offset,标题)...], 书名)。"""
+    with zipfile.ZipFile(path) as z:
+        container = ET.fromstring(z.read("META-INF/container.xml"))
+        opf_path = None
+        for el in container.iter():
+            if _strip_ns(el.tag) == "rootfile":
+                opf_path = el.get("full-path")
+                break
+        if not opf_path or opf_path not in z.namelist():
+            raise RuntimeError("无效的 epub：找不到 OPF 清单文件")
+        opf = ET.fromstring(z.read(opf_path))
+        opf_dir = posixpath.dirname(opf_path)
+        manifest, spine, title = {}, [], ""
+        for el in opf.iter():
+            t = _strip_ns(el.tag)
+            if t == "item":
+                i, href = el.get("id"), el.get("href")
+                if i and href:
+                    manifest[i] = href
+            elif t == "itemref":
+                if el.get("idref"):
+                    spine.append(el.get("idref"))
+            elif t == "title":
+                title = (el.text or "").strip()
+        parts, chapters = [], []
+        offset = 0
+        for idref in spine:
+            href = manifest.get(idref)
+            if not href:
+                continue
+            full = posixpath.normpath(posixpath.join(opf_dir, unquote(href)))
+            if full not in z.namelist():
+                continue
+            ch_text, ch_title = _html_to_text(z.read(full))
+            if not ch_text:
+                continue
+            chapters.append((offset, ch_title or f"第 {len(chapters) + 1} 章"))
+            parts.append(ch_text)
+            offset += len(ch_text) + 2
+        if not parts:
+            raise RuntimeError("epub 中没有可读取的正文")
+        return "\n\n".join(parts), chapters, title
+
+def load_html_file(path):
+    """HTML 文件 → (全文, 章节, 标题)。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    text, title = _html_to_text(raw)
+    chapters = scan_chapters(text)
+    return text, chapters, title
+
 # ============ 后台加载（不阻塞 UI） ============
 class BookLoader(QObject):
-    loaded = Signal(str, list)     # (全文, 章节)
+    loaded = Signal(str, list, str)   # (全文, 章节, 书名)
     failed = Signal(str)
-    progress = Signal(int, str)    # (百分比, 说明)
+    progress = Signal(int, str)       # (百分比, 说明)
     def __init__(self, path):
         super().__init__()
         self.path = path
     def run(self):
         try:
-            self.progress.emit(5, "读取文件…")
-            with open(self.path, "rb") as f:
-                raw = f.read()
-            self.progress.emit(40, "解码…")
-            text = decode_text(raw)
-            self.progress.emit(65, "扫描章节…")
-            chapters = scan_chapters(text)
+            ext = os.path.splitext(self.path)[1].lower()
+            if ext == ".epub":
+                self.progress.emit(10, "解析 epub…")
+                text, chapters, title = load_epub(self.path)
+            elif ext in (".html", ".htm"):
+                self.progress.emit(10, "读取文件…")
+                text, chapters, title = load_html_file(self.path)
+            else:
+                self.progress.emit(5, "读取文件…")
+                with open(self.path, "rb") as f:
+                    raw = f.read()
+                self.progress.emit(40, "解码…")
+                text = decode_text(raw)
+                self.progress.emit(65, "扫描章节…")
+                chapters = scan_chapters(text)
+                title = ""
             self.progress.emit(95, "完成")
-            self.loaded.emit(text, chapters)
+            self.loaded.emit(text, chapters, title)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -959,7 +1050,9 @@ class MainWindow(QMainWindow):
                 "para_spacing": c.get("para_spacing", PARA_SPACING)}
 
     def open_book(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开小说", "", "文本文件 (*.txt *.md)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开小说", "",
+            "电子书 (*.txt *.md *.epub *.html *.htm);;文本 (*.txt *.md);;EPUB (*.epub);;网页 (*.html *.htm)")
         if path:
             self.load_book(path)
 
@@ -983,14 +1076,14 @@ class MainWindow(QMainWindow):
         self.load_bar.hide()
         QMessageBox.critical(self, "错误", msg)
 
-    def _on_book_loaded(self, text, chapters):
+    def _on_book_loaded(self, text, chapters, title=""):
         self.load_bar.hide()
         self.full_text = text
         self.view.set_layout(self._make_layout())
         self.pager = LazyPager(text, chapters)
         self.pager.set_params(self.view.pagination_params())
         self.view.full_text = text
-        self.view.book_title = os.path.splitext(os.path.basename(self.book_path))[0]
+        self.view.book_title = title or os.path.splitext(os.path.basename(self.book_path))[0]
         self._build_toc()
         self._load_bookmarks()
         self.setWindowTitle(os.path.basename(self.book_path) + " — PyReader")

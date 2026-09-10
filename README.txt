@@ -4,6 +4,12 @@ PyReader —— 基于 Python 的文本小说阅读器
 【启动】
   双击  start.bat
   或命令行:  python reader.py 小说.txt
+  或命令行:  python reader.py 书.epub
+
+【支持格式】
+  txt / md      纯文本（自动识别 UTF-8/UTF-16/GBK/Big5）
+  epub         电子书（自动解析章节、书名，标准库零依赖）
+  html / htm   网页（剥标签后阅读，标题自动识别）
 
 【已实现功能】
   1. 左右双页分页显示（书脊式）
@@ -28,6 +34,7 @@ PyReader —— 基于 Python 的文本小说阅读器
   16. 阅读主题（夜间/纯白/米黄护眼/浅绿护眼）
   17. 最近打开列表（工具栏“🕘 最近”）
   18. 定时关闭（工具栏“⏰ 定时”，睡前听书自动停）
+  19. 支持 epub / html / htm 格式（自动解析章节与书名）
 
 【快捷键】
   左箭头 / PageUp      上一页
