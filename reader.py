@@ -1,10 +1,16 @@
 # reader.py —— 基于 PySide6 的文本小说阅读器（支持大文件惰性分页）
 # 双击 start.bat 或命令行:  python reader.py 小说.txt
-import sys, json, re, os, threading, bisect, urllib.request
+import sys, json, re, os, threading, bisect, urllib.request, asyncio
 from typing import List, Tuple, Optional
 
-from PySide6.QtCore import Qt, QRectF, QSizeF, QPointF, Signal, QObject, QTimer, QEvent
+from PySide6.QtCore import Qt, QRectF, QSizeF, QPointF, Signal, QObject, QTimer, QEvent, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QFont, QFontMetricsF, QPainter, QColor, QPen, QNativeGestureEvent, QBrush, QLinearGradient
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    _HAS_MULTIMEDIA = True
+except Exception:
+    QMediaPlayer = QAudioOutput = None
+    _HAS_MULTIMEDIA = False
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem,
     QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel, QFileDialog,
@@ -228,7 +234,8 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "line_spacing": 1.5, "margin_x": 28.0, "margin_y": 44.0,
                   "outer": 16.0, "gutter": 36.0, "para_spacing": 0.6,
                   "api_key": "", "api_base": "https://api.openai.com/v1",
-                  "model": "gpt-4o-mini"}
+                  "model": "gpt-4o-mini",
+                  "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%"}
 
 def default_cjk_font() -> str:
     """优先选一个好看的中文阅读字体。"""
@@ -274,6 +281,73 @@ class AiWorker(QObject):
         except Exception as e:
             self.failed.emit(str(e))
 
+# ============ 语音朗读（edge-tts） ============
+TTS_VOICES = [
+    ("晓晓（女·温柔，默认）", "zh-CN-XiaoxiaoNeural"),
+    ("晓伊（女·活泼）", "zh-CN-XiaoyiNeural"),
+    ("晓墨（女·可爱）", "zh-CN-XiaomoNeural"),
+    ("云希（男·少年）", "zh-CN-YunxiNeural"),
+    ("云扬（男·新闻）", "zh-CN-YunyangNeural"),
+    ("云健（男）", "zh-CN-YunjianNeural"),
+    ("晓北（东北女声）", "zh-CN-liaoning-XiaobeiNeural"),
+    ("晓妮（陕西女声）", "zh-CN-shaanxi-XiaoniNeural"),
+    ("晓臻（台湾女声）", "zh-TW-HsiaoChenNeural"),
+    ("云哲（台湾男声）", "zh-TW-YunJheNeural"),
+]
+TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
+TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+
+def split_sentences(text: str, base: int = 0):
+    """把文本切成句子：返回 [(起始偏移, 结束偏移, 句子文本)]，偏移为全局字符偏移。"""
+    res = []
+    seg_start = 0
+    i = 0
+    n = len(text)
+    buf_len = 0
+    while i < n:
+        ch = text[i]
+        buf_len += 1
+        if ch in "。！？!?；;" or ch == "\n" or buf_len >= 100:
+            end = i + 1
+            seg = text[seg_start:end]
+            if seg.strip():
+                res.append((base + seg_start, base + end, seg))
+            seg_start = end
+            buf_len = 0
+        i += 1
+    if seg_start < n:
+        seg = text[seg_start:n]
+        if seg.strip():
+            res.append((base + seg_start, base + n, seg))
+    return res
+
+def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
+    """把一段文本合成 mp3 字节（edge-tts，直连）。"""
+    try:
+        import edge_tts
+    except Exception as e:
+        raise RuntimeError("未安装 edge-tts，请执行：pip install edge-tts") from e
+    async def go():
+        com = edge_tts.Communicate(text, voice, rate=rate)
+        out = []
+        async for chunk in com.stream():
+            if chunk["type"] == "audio":
+                out.append(chunk["data"])
+        return b"".join(out)
+    return asyncio.run(go())
+
+class TtsWorker(QObject):
+    ready = Signal(int, bytes)     # (句子序号, mp3 字节)
+    failed = Signal(str)
+    def __init__(self, seq, text, voice, rate):
+        super().__init__()
+        self.seq, self.text, self.voice, self.rate = seq, text, voice, rate
+    def run(self):
+        try:
+            self.ready.emit(self.seq, synthesize_tts(self.text, self.voice, self.rate))
+        except Exception as e:
+            self.failed.emit(str(e))
+
 # ============ 双页视图（显示"当前章节"的页） ============
 class PageView(QWidget):
     pageChanged = Signal(int)          # 左页的全局字符偏移
@@ -291,6 +365,7 @@ class PageView(QWidget):
         self.line_h = QFontMetricsF(self.font).height() * self.line_spacing
         self.spread = 0
         self.sel_start = self.sel_end = -1
+        self.read_start = self.read_end = -1   # 朗读高亮范围
         self.selecting = False
         self._press_pos = None
         self._dragged = False
@@ -397,6 +472,11 @@ class PageView(QWidget):
             if ln.text:
                 ix = indent_w if ln.indent else 0.0
                 line_x = tx + ix
+                rs, re_ = max(ln.start, self.read_start), min(ln.end, self.read_end)
+                if rs < re_:
+                    x1 = line_x + fm.horizontalAdvance(ln.text[:rs - ln.start])
+                    x2 = line_x + fm.horizontalAdvance(ln.text[:re_ - ln.start])
+                    p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), QColor("#ffe08a"))
                 s, e = max(ln.start, self.sel_start), min(ln.end, self.sel_end)
                 if s < e:
                     x1 = line_x + fm.horizontalAdvance(ln.text[:s - ln.start])
@@ -627,6 +707,16 @@ class SettingsDialog(QDialog):
         self.outer.setValue(cfg.get("outer", 16))
         self.gutter = QSpinBox(); self.gutter.setRange(0, 160)
         self.gutter.setValue(cfg.get("gutter", 32))
+        # 语音朗读（edge-tts）
+        self.tts_voice = QComboBox()
+        for label, vid in TTS_VOICES:
+            self.tts_voice.addItem(label, vid)
+        vi = self.tts_voice.findData(cfg.get("tts_voice", TTS_DEFAULT_VOICE))
+        self.tts_voice.setCurrentIndex(vi if vi >= 0 else 0)
+        self.tts_rate = QComboBox()
+        self.tts_rate.addItems(TTS_RATES)
+        ri = self.tts_rate.findText(cfg.get("tts_rate", "+0%"))
+        self.tts_rate.setCurrentIndex(ri if ri >= 0 else 3)
         # 根据当前 base 反推预设（先设值，后连信号，避免误触发覆盖用户自定义模型）
         cur = cfg.get("api_base", "").rstrip("/")
         matched = False
@@ -650,6 +740,9 @@ class SettingsDialog(QDialog):
         form.addRow("上下边距", self.margin_y)
         form.addRow("页边距(外)", self.outer)
         form.addRow("书脊", self.gutter)
+        form.addRow("语音朗读", QLabel("（edge-tts，需联网）"))
+        form.addRow("朗读音色", self.tts_voice)
+        form.addRow("朗读语速", self.tts_rate)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
         form.addRow(btn)
@@ -693,6 +786,23 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.ai_dock)
         self.ai_dock.hide()                              # 默认隐藏
 
+        # ---- 语音朗读（edge-tts）----
+        self.player = QMediaPlayer(self) if _HAS_MULTIMEDIA else None
+        if self.player:
+            self.audio_out = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio_out)
+            self.player.mediaStatusChanged.connect(self._on_tts_media_status)
+        self.tts_on = False
+        self.tts_paused = False
+        self.tts_chapter = 0
+        self.tts_epoch = 0            # 章节代际，用于忽略过期合成结果
+        self.tts_sentences = []       # [(start, end, text)]
+        self.tts_idx = 0
+        self.tts_cache = {}           # seq -> mp3 字节
+        self.tts_inflight = set()
+        self.tts_workers = {}         # seq -> TtsWorker（防止信号前被 GC）
+        self.tts_buf = None
+
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True); self._resize_timer.setInterval(200)
         self._resize_timer.timeout.connect(self.reload_current)
@@ -728,6 +838,10 @@ class MainWindow(QMainWindow):
         tb.addAction("下一页 ▶", lambda: self.view.flip(1))
         tb.addAction("添加书签", self.add_bookmark)
         tb.addSeparator()
+        self.tts_act = tb.addAction("🔊 朗读", self.toggle_reading)
+        self.stop_act = tb.addAction("⏹ 停止", self.stop_reading)
+        self.stop_act.setEnabled(False)
+        tb.addSeparator()
         tb.addAction(self.toc_dock.toggleViewAction())   # 目录 显示/隐藏
         tb.addAction(self.ai_dock.toggleViewAction())    # AI 工具 显示/隐藏
 
@@ -757,6 +871,7 @@ class MainWindow(QMainWindow):
             self.load_book(path)
 
     def load_book(self, path):
+        self._tts_stop()
         self.book_path = path
         self.load_bar.show()
         self.load_bar.setValue(0)
@@ -880,6 +995,8 @@ class MainWindow(QMainWindow):
                 "para_spacing": dlg.para_spacing.value(),
                 "margin_x": dlg.margin_x.value(), "margin_y": dlg.margin_y.value(),
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
+                "tts_voice": dlg.tts_voice.currentData(),
+                "tts_rate": dlg.tts_rate.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
             self.reload_current()
@@ -900,6 +1017,176 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.ai_out.setPlainText)
         self.worker.failed.connect(lambda m: self.ai_out.setPlainText("出错：" + m))
         threading.Thread(target=self.worker.run, daemon=True).start()
+
+    # ---- 语音朗读（edge-tts）----
+    def toggle_reading(self):
+        if not _HAS_MULTIMEDIA:
+            self.statusBar().showMessage("未安装 QtMultimedia，无法朗读")
+            return
+        if self.tts_on and not self.tts_paused:
+            self.player.pause(); self.tts_paused = True
+            self._update_tts_actions(); return
+        if self.tts_on and self.tts_paused:
+            self.tts_paused = False
+            self._update_tts_actions()
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+                self.player.play()
+            else:
+                data = self.tts_cache.pop(self.tts_idx, None)
+                if data is not None:
+                    self._tts_play_data(self.tts_idx, data)
+                else:
+                    self._tts_kick(self.tts_idx)
+            return
+        if not self.pager or not self.full_text:
+            return
+        self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
+        self.tts_on = True; self.tts_paused = False
+        self._update_tts_actions()
+        if self._tts_load_chapter(self.cur_chapter, start_off=self.view.left_page_offset()):
+            self._tts_start_sentence(0)
+        else:
+            self._tts_next_chapter()
+
+    def stop_reading(self):
+        self._tts_stop()
+
+    def _tts_load_chapter(self, ci, start_off=None):
+        """把第 ci 章的文本切成句子，返回是否有可朗读句子。"""
+        ch = self.pager.chapters[ci]
+        if start_off is None:
+            start_off = ch.start
+        start_off = max(start_off, ch.start)
+        sents = split_sentences(self.full_text[ch.start:ch.end], base=ch.start)
+        sents = [(s, e, t) for s, e, t in sents if e > start_off]
+        sents = [(s, e, t) for s, e, t in sents if re.sub(r"\s+", " ", t).strip()]
+        self.tts_chapter = ci
+        self.tts_sentences = sents
+        self.tts_epoch += 1            # 换章：旧缓存/在途结果全部作废
+        self.tts_cache.clear(); self.tts_inflight.clear(); self.tts_workers.clear()
+        return bool(sents)
+
+    def _tts_next_chapter(self):
+        nc = self.tts_chapter + 1
+        while nc < len(self.pager.chapters):
+            if self._tts_load_chapter(nc):
+                self._tts_start_sentence(0)
+                return
+            nc += 1
+        self._tts_stop(finished=True)
+
+    def _tts_start_sentence(self, seq):
+        self.tts_idx = seq
+        s, e, _ = self.tts_sentences[seq]
+        self.view.read_start, self.view.read_end = s, e
+        self._reveal_offset(s)
+        self.statusBar().showMessage(
+            f"🔊 朗读中 · 第{self.tts_chapter + 1}章 · {seq + 1}/{len(self.tts_sentences)}句")
+        data = self.tts_cache.pop(seq, None)
+        if data is not None:
+            self._tts_play_data(seq, data)
+        else:
+            self._tts_kick(seq)
+        nxt = seq + 1
+        if nxt < len(self.tts_sentences) and nxt not in self.tts_cache and nxt not in self.tts_inflight:
+            self._tts_kick(nxt)
+
+    def _tts_kick(self, seq):
+        if seq in self.tts_inflight or seq in self.tts_cache:
+            return
+        _, _, text = self.tts_sentences[seq]
+        clean = re.sub(r"\s+", " ", text).strip()
+        if not clean:
+            return
+        self.tts_inflight.add(seq)
+        epoch = self.tts_epoch
+        w = TtsWorker(seq, clean,
+                      self.cfg.get("tts_voice", TTS_DEFAULT_VOICE),
+                      self.cfg.get("tts_rate", "+0%"))
+        w.ready.connect(lambda s, d, ep=epoch: self._tts_on_ready(ep, s, d))
+        w.failed.connect(lambda m, ep=epoch: self._tts_failed(ep, m))
+        self.tts_workers[(epoch, seq)] = w  # 保持引用，防止队列信号前被 GC
+        threading.Thread(target=w.run, daemon=True).start()
+
+    def _tts_on_ready(self, epoch, seq, data):
+        if not self.tts_on or epoch != self.tts_epoch:
+            return
+        self.tts_workers.pop((epoch, seq), None)
+        self.tts_inflight.discard(seq)
+        if seq == self.tts_idx and not self.tts_paused \
+           and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self._tts_play_data(seq, data)     # 当前句：直接播，不入缓存
+        else:
+            self.tts_cache[seq] = data         # 预取句：先缓存
+
+    def _tts_play_data(self, seq, data):
+        if not self.tts_on or seq != self.tts_idx:
+            return
+        if not data:
+            self._tts_advance()
+            return
+        buf = QBuffer()
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        self.tts_buf = buf
+        self.player.setSourceDevice(buf)
+        self.player.play()
+
+    def _tts_advance(self):
+        nxt = self.tts_idx + 1
+        if nxt < len(self.tts_sentences):
+            self._tts_start_sentence(nxt)
+        else:
+            self._tts_next_chapter()
+
+    def _on_tts_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            # 延迟到下一轮事件循环，避免在媒体信号回调里重入 play() 导致卡死
+            QTimer.singleShot(0, self._tts_advance)
+
+    def _tts_failed(self, epoch, msg):
+        if not self.tts_on or epoch != self.tts_epoch:
+            return
+        self.tts_inflight.clear(); self.tts_workers.clear()
+        self._tts_stop()
+        self.statusBar().showMessage("朗读失败：" + msg)
+
+    def _tts_stop(self, finished=False):
+        was_on = self.tts_on
+        self.tts_on = False; self.tts_paused = False
+        self.tts_idx = 0
+        self.tts_chapter = self.cur_chapter
+        self.tts_epoch += 1
+        self.tts_sentences = []
+        self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
+        if self.player:
+            self.player.stop()
+        self.tts_buf = None
+        self.view.read_start = self.view.read_end = -1
+        self.view.update()
+        self._update_tts_actions()
+        if finished:
+            self.statusBar().showMessage("全书朗读结束")
+        elif was_on:
+            self.statusBar().showMessage("已停止朗读")
+
+    def _update_tts_actions(self):
+        if self.tts_on and not self.tts_paused:
+            self.tts_act.setText("⏸ 暂停朗读"); self.stop_act.setEnabled(True)
+        elif self.tts_on and self.tts_paused:
+            self.tts_act.setText("▶ 继续朗读"); self.stop_act.setEnabled(True)
+        else:
+            self.tts_act.setText("🔊 朗读"); self.stop_act.setEnabled(False)
+
+    def _reveal_offset(self, off):
+        if not self.pager:
+            return
+        pages = self.view.pages
+        vis = pages[self.view.spread * 2:self.view.spread * 2 + 2]
+        if vis and vis[0].start <= off < vis[-1].end:
+            self.view.update()
+            return
+        self.goto_offset(off)
 
     def _update_status(self):
         if self.pager and self.full_text:
@@ -944,6 +1231,9 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(e)
 
     def closeEvent(self, e):
+        self.tts_on = False
+        if self.player:
+            self.player.stop()
         if self.book_path and self.pager:
             self.bookmarks.setdefault(self.book_path, {})["_progress_"] = self.view.left_page_offset()
             save_json(BOOKMARKS_PATH, self.bookmarks)
