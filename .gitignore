@@ -1,0 +1,11 @@
+# 本地生成的大文件测试数据（约 28MB）
+大文件测试.txt
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统杂物
+.vscode/
+.DS_Store
+Thumbs.db
