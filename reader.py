@@ -1,6 +1,6 @@
 # reader.py —— 基于 PySide6 的文本小说阅读器（支持大文件惰性分页）
 # 双击 start.bat 或命令行:  python reader.py 小说.txt
-import sys, json, re, os, threading, bisect, urllib.request, asyncio
+import sys, json, re, os, threading, bisect, urllib.request, asyncio, time
 from typing import List, Tuple, Optional
 
 from PySide6.QtCore import Qt, QRectF, QSizeF, QPointF, Signal, QObject, QTimer, QEvent, QBuffer, QByteArray, QIODevice
@@ -336,17 +336,38 @@ def split_sentences(text: str, base: int = 0):
     return res
 
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
-    """把一段文本合成 mp3 字节（edge-tts，直连）。"""
+    """把一段文本合成 mp3 字节（edge-tts，直连，带重试）。"""
     try:
         import edge_tts
     except Exception as e:
         raise RuntimeError("未安装 edge-tts，请执行：pip install edge-tts") from e
+    last_err = None
+    for attempt in range(3):
+        try:
+            return _synth_once(edge_tts, text, voice, rate)
+        except Exception as e:
+            last_err = e
+            _log_tts(f"[重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{e}")
+            time.sleep(0.6 * (attempt + 1))   # 0.6s / 1.2s 退避后重试
+    raise RuntimeError(f"语音合成失败（已重试3次）：{last_err}")
+
+def _log_tts(msg):
+    """把朗读相关事件写入 ~/.pyreader/tts.log。"""
+    try:
+        with open(os.path.join(APP_DIR, "tts.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+def _synth_once(edge_tts, text, voice, rate):
     async def go():
         com = edge_tts.Communicate(text, voice, rate=rate)
         out = []
         async for chunk in com.stream():
             if chunk["type"] == "audio":
                 out.append(chunk["data"])
+        if not out:
+            raise RuntimeError("edge-tts 未返回音频")
         return b"".join(out)
     return asyncio.run(go())
 
@@ -1134,6 +1155,8 @@ class MainWindow(QMainWindow):
         start_off = max(start_off, ch.start)
         sents = split_sentences(self.full_text[ch.start:ch.end], base=ch.start)
         sents = [(s, e, t) for s, e, t in sents if e > start_off]
+        # 过滤纯标点/无语义内容的句子（edge-tts 无法合成，会报 No audio）
+        sents = [(s, e, t) for s, e, t in sents if re.search(r"[0-9A-Za-z\u4e00-\u9fff]", t)]
         sents = [(s, e, t) for s, e, t in sents if re.sub(r"\s+", " ", t).strip()]
         self.tts_chapter = ci
         self.tts_sentences = sents
@@ -1225,6 +1248,7 @@ class MainWindow(QMainWindow):
         self.tts_inflight.clear(); self.tts_workers.clear()
         self._tts_stop()
         self.statusBar().showMessage("朗读失败：" + msg)
+        _log_tts(f"[失败] {msg}")
 
     def _tts_stop(self, finished=False):
         was_on = self.tts_on
