@@ -816,7 +816,7 @@ AI_PRESETS = {
     "OpenAI":     ("https://api.openai.com/v1", "gpt-4o-mini"),
     "DeepSeek":   ("https://api.deepseek.com", "deepseek-chat"),
     "通义千问":    ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-    "本地 Ollama": ("http://localhost:11434/v1", "qwen2.5:7b"),
+    "本地 Ollama": ("http://localhost:11434/v1", "ornith-1.5:9b"),
     "自定义":      ("", ""),
 }
 
