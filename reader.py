@@ -230,12 +230,26 @@ def save_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+# 配色主题：bg=桌面背景，page=书页，border=书页边框，text=正文，header=页眉，pageno=页码
+THEMES = {
+    "夜间（默认）": {"bg": "#1b1b1e", "page": "#fdfdfb", "border": "#d8d8d8",
+                 "text": "#1a1a1a", "header": "#9a9a9a", "pageno": "#a0a0a0"},
+    "纯白":     {"bg": "#e9e9eb", "page": "#ffffff", "border": "#d5d5d5",
+                 "text": "#1a1a1a", "header": "#9a9a9a", "pageno": "#a0a0a0"},
+    "米黄（护眼）": {"bg": "#c9b899", "page": "#f6edd8", "border": "#dccba6",
+                 "text": "#3a3226", "header": "#9a8768", "pageno": "#9a8768"},
+    "浅绿（护眼）": {"bg": "#b7c6af", "page": "#eaf1e1", "border": "#c9d6c0",
+                 "text": "#2c3828", "header": "#7d8c72", "pageno": "#7d8c72"},
+}
+DEFAULT_THEME = "夜间（默认）"
+
 DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "line_spacing": 1.5, "margin_x": 28.0, "margin_y": 44.0,
                   "outer": 16.0, "gutter": 36.0, "para_spacing": 0.6,
                   "api_key": "", "api_base": "https://api.openai.com/v1",
                   "model": "gpt-4o-mini",
-                  "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%"}
+                  "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%",
+                  "theme": DEFAULT_THEME, "recent": []}
 
 def default_cjk_font() -> str:
     """优先选一个好看的中文阅读字体。"""
@@ -366,6 +380,12 @@ class PageView(QWidget):
         self.spread = 0
         self.sel_start = self.sel_end = -1
         self.read_start = self.read_end = -1   # 朗读高亮范围
+        self.search_starts = []                # 搜索匹配起始偏移列表
+        self.search_len = 0
+        self.search_cur = -1                   # 当前匹配的起始偏移
+        # 主题配色
+        self.bg = "#1b1b1e"; self.page_color = "#fdfdfb"; self.page_border = "#d8d8d8"
+        self.text_color = "#1a1a1a"; self.header_color = "#9a9a9a"; self.pageno_color = "#a0a0a0"
         self.selecting = False
         self._press_pos = None
         self._dragged = False
@@ -392,6 +412,15 @@ class PageView(QWidget):
         self.gutter = layout["gutter"]
         self.para_spacing = layout.get("para_spacing", PARA_SPACING)
         self.line_h = QFontMetricsF(self.font).height() * self.line_spacing
+        self.update()
+
+    def set_theme(self, colors):
+        self.bg = colors["bg"]
+        self.page_color = colors["page"]
+        self.page_border = colors["border"]
+        self.text_color = colors["text"]
+        self.header_color = colors["header"]
+        self.pageno_color = colors["pageno"]
         self.update()
 
     def pagination_params(self):
@@ -430,7 +459,7 @@ class PageView(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#1b1b1e"))            # 深色背景，像翻开放在桌面上的书
+        p.fillRect(self.rect(), QColor(self.bg))              # 桌面背景（随主题）
         left, right = self.page_rects()
         li, ri = self.spread * 2, self.spread * 2 + 1
         self._draw_gutter_shadow(p, left, right)               # 书脊阴影
@@ -458,13 +487,13 @@ class PageView(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, int(22 / i)))
             p.drawRect(rect.adjusted(-i, -i, i, i))
-        # 白色书页
-        p.setPen(QPen(QColor("#d8d8d8"), 1))
-        p.setBrush(QColor("#fdfdfb"))
+        # 书页
+        p.setPen(QPen(QColor(self.page_border), 1))
+        p.setBrush(QColor(self.page_color))
         p.drawRect(rect)
 
         fm = QFontMetricsF(self.font)
-        p.setFont(self.font); p.setPen(QColor("#1a1a1a"))
+        p.setFont(self.font); p.setPen(QColor(self.text_color))
         indent_w = fm.horizontalAdvance("中") * INDENT_SPACES
         tx = rect.left() + self.margin_x
         y = rect.top() + self.margin_y          # 每行的“顶端”
@@ -477,6 +506,17 @@ class PageView(QWidget):
                     x1 = line_x + fm.horizontalAdvance(ln.text[:rs - ln.start])
                     x2 = line_x + fm.horizontalAdvance(ln.text[:re_ - ln.start])
                     p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), QColor("#ffe08a"))
+                # 搜索高亮：当前匹配亮橙，其余淡黄
+                if self.search_starts and self.search_len > 0:
+                    lo = bisect.bisect_left(self.search_starts, ln.start)
+                    hi = bisect.bisect_left(self.search_starts, ln.end)
+                    for k in range(lo, hi):
+                        ms = self.search_starts[k]
+                        me = min(ms + self.search_len, ln.end)
+                        x1 = line_x + fm.horizontalAdvance(ln.text[:ms - ln.start])
+                        x2 = line_x + fm.horizontalAdvance(ln.text[:me - ln.start])
+                        col = QColor("#ffb340") if ms == self.search_cur else QColor("#ffe9a8")
+                        p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), col)
                 s, e = max(ln.start, self.sel_start), min(ln.end, self.sel_end)
                 if s < e:
                     x1 = line_x + fm.horizontalAdvance(ln.text[:s - ln.start])
@@ -488,7 +528,7 @@ class PageView(QWidget):
         # 页眉（顶部居中，左侧书名 / 右侧章节），与正文留出清晰间距
         if header_text:
             hf = QFont(self.font); hf.setPointSize(max(9, self.font.pointSize() - 4))
-            p.setFont(hf); p.setPen(QColor("#9a9a9a"))
+            p.setFont(hf); p.setPen(QColor(self.header_color))
             p.drawText(QRectF(rect.left(), rect.top() + 6, rect.width(), self.margin_y - 18),
                        int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
                        header_text)
@@ -497,7 +537,7 @@ class PageView(QWidget):
         pg = max(1, int(page.start / max(1.0, self.chars_per_page)) + 1)
         total = max(1, int(len(self.full_text) / max(1.0, self.chars_per_page)))
         pf = QFont(self.font); pf.setPointSize(max(9, self.font.pointSize() - 4))
-        p.setFont(pf); p.setPen(QColor("#a0a0a0"))
+        p.setFont(pf); p.setPen(QColor(self.pageno_color))
         p.drawText(QRectF(rect.left(), rect.bottom() - self.margin_y + 10, rect.width(), self.margin_y - 18),
                    int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
                    f"{pg} / {total}")
@@ -693,6 +733,10 @@ class SettingsDialog(QDialog):
             pass
         i = self.font_family.findData(cfg.get("font_family", ""))
         self.font_family.setCurrentIndex(i if i >= 0 else 0)
+        self.theme = QComboBox()
+        self.theme.addItems(list(THEMES.keys()))
+        ti = self.theme.findText(cfg.get("theme", DEFAULT_THEME))
+        self.theme.setCurrentIndex(ti if ti >= 0 else 0)
         self.font_size = QSpinBox(); self.font_size.setRange(10, 48)
         self.font_size.setValue(cfg.get("font_size", 16))
         self.line_spacing = QDoubleSpinBox(); self.line_spacing.setRange(0.8, 3.0)
@@ -733,6 +777,7 @@ class SettingsDialog(QDialog):
         form.addRow("模型", self.model)
         form.addRow("排版", QLabel("（调整后立即生效）"))
         form.addRow("字体", self.font_family)
+        form.addRow("主题", self.theme)
         form.addRow("字号", self.font_size)
         form.addRow("行距", self.line_spacing)
         form.addRow("段落间距", self.para_spacing)
@@ -766,6 +811,8 @@ class MainWindow(QMainWindow):
 
         self.view = PageView()
         self.view.set_layout(self._make_layout())
+        self.view.set_theme(THEMES.get(self.cfg.get("theme"), THEMES[DEFAULT_THEME]))
+        self.search_matches = []; self.search_query = ""; self.search_cur = -1
         self.toc = QListWidget()
         self.bm_list = QListWidget()
         self.ai_out = QTextEdit(); self.ai_out.setReadOnly(True)
@@ -808,6 +855,7 @@ class MainWindow(QMainWindow):
         self._resize_timer.timeout.connect(self.reload_current)
 
         self._build_toolbar(); self._build_menus()
+        self._rebuild_recent_menu()
 
         # 底部状态栏：加载进度条 + 阅读进度（可拖动跳转）
         self.load_bar = QProgressBar()
@@ -822,6 +870,14 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.read_slider)
         self.statusBar().addPermanentWidget(self.pos_label)
         self.statusBar().addPermanentWidget(self.load_bar)
+        # 定时关闭（睡前听书）
+        self.sleep_left = 0
+        self.sleep_label = QLabel("")
+        self.sleep_label.hide()
+        self.sleep_timer = QTimer(self)
+        self.sleep_timer.setInterval(1000)
+        self.sleep_timer.timeout.connect(self._on_sleep_tick)
+        self.statusBar().addPermanentWidget(self.sleep_label)
 
         self.statusBar().showMessage("就绪")
         self.resize(1280, 800)
@@ -841,9 +897,25 @@ class MainWindow(QMainWindow):
         self.tts_act = tb.addAction("🔊 朗读", self.toggle_reading)
         self.stop_act = tb.addAction("⏹ 停止", self.stop_reading)
         self.stop_act.setEnabled(False)
+        self.sleep_act = tb.addAction("⏰ 定时")
+        self.sleep_act.setMenu(self._build_sleep_menu())
         tb.addSeparator()
         tb.addAction(self.toc_dock.toggleViewAction())   # 目录 显示/隐藏
         tb.addAction(self.ai_dock.toggleViewAction())    # AI 工具 显示/隐藏
+        # 最近打开（下拉菜单）
+        self.recent_menu = QMenu("最近打开", self)
+        self.recent_act = tb.addAction("🕘 最近")
+        self.recent_act.setMenu(self.recent_menu)
+        # 全文搜索
+        tb.addSeparator()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("搜索 Ctrl+F")
+        self.search_box.setFixedWidth(150)
+        self.search_box.textChanged.connect(self._on_search_changed)
+        self.search_box.returnPressed.connect(self._search_next)
+        tb.addWidget(self.search_box)
+        tb.addAction("↑", self._search_prev)
+        tb.addAction("↓", self._search_next)
 
     def _build_menus(self):
         self.toc.itemClicked.connect(lambda it: self.goto_offset(it.data(Qt.ItemDataRole.UserRole)))
@@ -904,6 +976,7 @@ class MainWindow(QMainWindow):
         prog = self.bookmarks.get(self.book_path, {}).get("_progress_", 0)
         self.goto_offset(prog)
         self._update_status()
+        self._add_recent(self.book_path)
 
     # ---- 章节导航（惰性分页的入口） ----
     def load_chapter(self, ci, goto_end=False):
@@ -997,8 +1070,10 @@ class MainWindow(QMainWindow):
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
+                "theme": dlg.theme.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
+            self.view.set_theme(THEMES.get(self.cfg["theme"], THEMES[DEFAULT_THEME]))
             self.reload_current()
 
     def _show_ctx_menu(self, pos):
@@ -1205,6 +1280,110 @@ class MainWindow(QMainWindow):
             self.view.chars_per_page = max(1, (ch.end - ch.start) / max(1, len(pages))) if pages else 400.0
             self.view.update()
 
+    # ---- 全文搜索 ----
+    def _find_all(self, query):
+        if not query or not self.full_text:
+            return []
+        starts, pos, n = [], 0, len(self.full_text)
+        while True:
+            pos = self.full_text.find(query, pos)
+            if pos == -1:
+                break
+            starts.append(pos)
+            pos += 1
+            if len(starts) >= 5000:      # 上限，防止巨量匹配拖慢 UI
+                break
+        return starts
+
+    def _on_search_changed(self, text):
+        self.search_query = text
+        self.view.search_starts = []; self.view.search_len = 0; self.view.search_cur = -1
+        if not text:
+            self.search_matches = []; self.search_cur = -1
+            self.view.update()
+            return
+        self.search_matches = self._find_all(text)
+        self.search_cur = -1
+        if self.search_matches:
+            self._goto_search(0)
+        else:
+            self.view.update()
+            self.statusBar().showMessage("搜索：无匹配")
+
+    def _goto_search(self, idx):
+        if not self.search_matches:
+            return
+        idx %= len(self.search_matches)
+        self.search_cur = idx
+        off = self.search_matches[idx]
+        self.view.search_starts = self.search_matches
+        self.view.search_len = len(self.search_query)
+        self.view.search_cur = off
+        self.goto_offset(off)
+        self.statusBar().showMessage(f"搜索：第 {idx + 1}/{len(self.search_matches)} 个匹配")
+
+    def _search_next(self):
+        if self.search_matches:
+            self._goto_search(self.search_cur + 1)
+
+    def _search_prev(self):
+        if self.search_matches:
+            self._goto_search(self.search_cur - 1)
+
+    # ---- 定时关闭（睡前听书）----
+    def _build_sleep_menu(self):
+        m = QMenu(self)
+        for mins in (15, 30, 45, 60):
+            m.addAction(f"{mins} 分钟后停止", lambda ms=mins: self._set_sleep(ms * 60))
+        m.addSeparator()
+        m.addAction("关闭定时", self._cancel_sleep)
+        return m
+
+    def _set_sleep(self, seconds):
+        self.sleep_left = seconds
+        self.sleep_timer.start()
+        self.sleep_label.show()
+        self._update_sleep_label()
+        self.statusBar().showMessage(f"⏰ 已开启定时，{seconds // 60} 分钟后停止朗读")
+
+    def _cancel_sleep(self):
+        self.sleep_timer.stop()
+        self.sleep_left = 0
+        self.sleep_label.hide()
+        self.sleep_label.setText("")
+
+    def _on_sleep_tick(self):
+        self.sleep_left -= 1
+        if self.sleep_left <= 0:
+            self._cancel_sleep()
+            if self.tts_on:
+                self.stop_reading()
+            self.statusBar().showMessage("⏰ 定时时间到，已停止朗读")
+        else:
+            self._update_sleep_label()
+
+    def _update_sleep_label(self):
+        m, s = divmod(max(0, self.sleep_left), 60)
+        self.sleep_label.setText(f"⏰ {m:02d}:{s:02d}")
+
+    # ---- 最近打开 ----
+    def _rebuild_recent_menu(self):
+        self.recent_menu.clear()
+        for p in self.cfg.get("recent", []):
+            if os.path.exists(p):
+                self.recent_menu.addAction(os.path.basename(p), lambda p=p: self.load_book(p))
+        if self.recent_menu.isEmpty():
+            self.recent_menu.addAction("（暂无）").setEnabled(False)
+
+    def _add_recent(self, path):
+        rec = list(self.cfg.get("recent", []))
+        if path in rec:
+            rec.remove(path)
+        rec.insert(0, path)
+        self.cfg["recent"] = rec[:8]
+        save_json(CONFIG_PATH, self.cfg)
+        self._rebuild_recent_menu()
+
     # ---- 进度条拖动跳转 ----
     def _on_slider_move(self, val):
         if not self.full_text:
@@ -1223,6 +1402,14 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_F and (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.search_box.setFocus(); self.search_box.selectAll(); return
+        if e.key() == Qt.Key.Key_F3:
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._search_prev()
+            else:
+                self._search_next()
+            return
         if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_PageUp):
             self.view.flip(-1)
         elif e.key() in (Qt.Key.Key_Right, Qt.Key.Key_PageDown, Qt.Key.Key_Space):
