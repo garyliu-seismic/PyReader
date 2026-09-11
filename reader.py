@@ -215,6 +215,10 @@ def _html_to_text(raw: bytes):
     m = re.search(r"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>", s)
     if m:
         title = html.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(1))).strip()
+    if not title:
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", s)
+        if m:
+            title = html.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(1))).strip()
     # 块级元素 → 换行
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</(p|div|h[1-6]|li|tr|blockquote)>", "\n", s)
@@ -278,6 +282,30 @@ def load_html_file(path):
     chapters = scan_chapters(text)
     return text, chapters, title
 
+def load_kindle(path):
+    """解析 Kindle 格式（mobi/azw/azw3/prc）→ (全文, 章节, 书名)。
+    KF8 (azw3) 会被解成 epub 复用现有解析，旧版 mobi 解成 html。"""
+    try:
+        import mobi
+    except Exception as e:
+        raise RuntimeError("未安装 mobi 库，请执行：pip install mobi") from e
+    try:
+        from loguru import logger as _mobi_logger
+        _mobi_logger.remove()        # 关闭 kindleunpack 的调试日志输出
+    except Exception:
+        pass
+    try:
+        _tempdir, out = mobi.extract(path)
+    except Exception as e:
+        raise RuntimeError(
+            "无法解析此 Kindle 文件（若为带 DRM 保护的官方电子书，请先用 Calibre 去除保护）：" + str(e)) from e
+    ext = os.path.splitext(out)[1].lower()
+    if ext == ".epub":
+        return load_epub(out)        # KF8 (azw3) → epub
+    if ext in (".html", ".htm"):
+        return load_html_file(out)   # 旧版 mobi/azw/prc → html
+    raise RuntimeError("此 Kindle 文件为 PDF 型（Print Replica），暂不支持，请先转换为 EPUB")
+
 # ============ 后台加载（不阻塞 UI） ============
 class BookLoader(QObject):
     loaded = Signal(str, list, str)   # (全文, 章节, 书名)
@@ -295,6 +323,11 @@ class BookLoader(QObject):
             elif ext in (".html", ".htm"):
                 self.progress.emit(10, "读取文件…")
                 text, chapters, title = load_html_file(self.path)
+            elif ext in (".mobi", ".azw", ".azw3", ".azw8", ".prc"):
+                self.progress.emit(10, "解析 Kindle 文件…")
+                text, chapters, title = load_kindle(self.path)
+            elif ext == ".kfx":
+                raise RuntimeError("暂不支持 KFX 格式，请先用 Calibre 转换为 EPUB 或 MOBI")
             else:
                 self.progress.emit(5, "读取文件…")
                 with open(self.path, "rb") as f:
@@ -1052,7 +1085,7 @@ class MainWindow(QMainWindow):
     def open_book(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", "",
-            "电子书 (*.txt *.md *.epub *.html *.htm);;文本 (*.txt *.md);;EPUB (*.epub);;网页 (*.html *.htm)")
+            "电子书 (*.txt *.md *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc);;文本 (*.txt *.md);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm)")
         if path:
             self.load_book(path)
 

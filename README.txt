@@ -10,6 +10,10 @@ PyReader —— 基于 Python 的文本小说阅读器
   txt / md      纯文本（自动识别 UTF-8/UTF-16/GBK/Big5）
   epub         电子书（自动解析章节、书名，标准库零依赖）
   html / htm   网页（剥标签后阅读，标题自动识别）
+  mobi / azw / azw3 / prc   Kindle 格式（自动解析章节、书名）
+
+  说明：Kindle 的 KFX 格式暂不支持；带 DRM 保护的官方电子书需先用
+  Calibre 去除保护后才能打开（本程序不提供 DRM 去除）。
 
 【已实现功能】
   1. 左右双页分页显示（书脊式）
@@ -34,7 +38,7 @@ PyReader —— 基于 Python 的文本小说阅读器
   16. 阅读主题（夜间/纯白/米黄护眼/浅绿护眼）
   17. 最近打开列表（工具栏“🕘 最近”）
   18. 定时关闭（工具栏“⏰ 定时”，睡前听书自动停）
-  19. 支持 epub / html / htm 格式（自动解析章节与书名）
+  19. 支持 epub / html / htm / mobi / azw / azw3 / prc 格式（自动解析章节与书名）
 
 【快捷键】
   左箭头 / PageUp      上一页
@@ -52,6 +56,11 @@ PyReader —— 基于 Python 的文本小说阅读器
   采用"按章节惰性分页"：打开只读文件+扫描目录（后台线程），
   只给当前章节分页并缓存附近章节，因此 10MB、100MB 都能秒开不卡。
   无章节的纯文本会自动按 20 万字符切成伪章节。
+
+【依赖安装】
+  pip install PySide6          # 图形界面（标准安装即含 QtMultimedia）
+  pip install edge-tts        # 语音朗读（可选，需联网）
+  pip install mobi            # Kindle 格式支持（mobi/azw/azw3/prc，可选）
 
 【编码说明】
   自动识别 UTF-8 / UTF-16 / GBK(GB18030) / Big5，
