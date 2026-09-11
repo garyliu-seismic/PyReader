@@ -391,15 +391,17 @@ def default_cjk_font() -> str:
     return ""
 
 def call_llm(prompt, cfg):
-    if not cfg.get("api_key"):
+    key = (cfg.get("api_key") or "").strip()
+    if not key:
         raise RuntimeError("未配置 API Key（工具栏→设置）")
-    payload = {"model": cfg["model"], "messages": [{"role": "user", "content": prompt}],
+    base = (cfg.get("api_base") or "https://api.openai.com/v1").strip().rstrip("/")
+    payload = {"model": (cfg.get("model") or "").strip(), "messages": [{"role": "user", "content": prompt}],
                "temperature": 0.2}
     req = urllib.request.Request(
-        cfg["api_base"].rstrip("/") + "/chat/completions",
+        base + "/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + cfg["api_key"]})
+                 "Authorization": "Bearer " + key})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())["choices"][0]["message"]["content"]
 
@@ -520,15 +522,15 @@ class TtsWorker(QObject):
 
 class TranslateWorker(QObject):
     done = Signal(int, str)        # (句子序号, 译文)
-    failed = Signal(int)
+    failed = Signal(int, str)      # (句子序号, 错误信息)
     def __init__(self, seq, text, cfg, target):
         super().__init__()
         self.seq, self.text, self.cfg, self.target = seq, text, cfg, target
     def run(self):
         try:
             self.done.emit(self.seq, translate_to(self.text, self.cfg, self.target))
-        except Exception:
-            self.failed.emit(self.seq)
+        except Exception as e:
+            self.failed.emit(self.seq, str(e))
 
 # ============ 双页视图（显示"当前章节"的页） ============
 class PageView(QWidget):
@@ -1258,7 +1260,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.cfg.update({
-                "api_key": dlg.key.text(), "api_base": dlg.base.text(), "model": dlg.model.text(),
+                "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(), "model": dlg.model.text().strip(),
                 "font_family": dlg.font_family.currentData(),
                 "font_size": dlg.font_size.value(), "line_spacing": dlg.line_spacing.value(),
                 "para_spacing": dlg.para_spacing.value(),
@@ -1328,7 +1330,7 @@ class MainWindow(QMainWindow):
         epoch = self.tts_epoch
         w = TranslateWorker(seq, clean, self.cfg, self.cfg.get("bilingual_target", "中文"))
         w.done.connect(lambda s, t, ep=epoch: self._tr_on_done(ep, s, t))
-        w.failed.connect(lambda s, ep=epoch: self._tr_on_failed(ep, s))
+        w.failed.connect(lambda s, m, ep=epoch: self._tr_on_failed(ep, s, m))
         self.tr_workers[seq] = w
         threading.Thread(target=w.run, daemon=True).start()
 
@@ -1341,12 +1343,18 @@ class MainWindow(QMainWindow):
         if seq == self.tts_idx and self.bilingual_on:
             self._update_bilingual(seq)
 
-    def _tr_on_failed(self, epoch, seq):
+    def _tr_on_failed(self, epoch, seq, msg):
         if epoch != self.tts_epoch:
             return
         self.tr_inflight.discard(seq)
         self.tr_workers.pop(seq, None)
-        self.tr_cache[seq] = "（翻译失败）"
+        if "401" in msg or "Authorization" in msg:
+            hint = "API Key 无效，请到 工具栏→设置 重新填写"
+        elif "未配置 API Key" in msg:
+            hint = "未配置 API Key（工具栏→设置）"
+        else:
+            hint = msg[:120]
+        self.tr_cache[seq] = f"（翻译失败：{hint}）"
         if seq == self.tts_idx and self.bilingual_on:
             self._update_bilingual(seq)
 
