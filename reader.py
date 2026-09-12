@@ -444,6 +444,8 @@ TTS_VOICES = [
     ("Guy（英文·美式·男）", "en-US-GuyNeural"),
     ("Sonia（英文·英式·女）", "en-GB-SoniaNeural"),
     ("Ryan（英文·英式·男）", "en-GB-RyanNeural"),
+    ("Nanami（日文·女）", "ja-JP-NanamiNeural"),
+    ("Keita（日文·男）", "ja-JP-KeitaNeural"),
 ]
 TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
 TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
