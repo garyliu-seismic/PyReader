@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem,
     QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel, QFileDialog,
     QMessageBox, QDialog, QLineEdit, QFormLayout, QDialogButtonBox,
-    QComboBox, QProgressBar, QSlider, QSwipeGesture, QPanGesture,
+    QCheckBox, QComboBox, QProgressBar, QSlider, QSwipeGesture, QPanGesture,
     QSpinBox, QDoubleSpinBox, QDockWidget,
 )
 
@@ -215,6 +215,10 @@ def _html_to_text(raw: bytes):
     m = re.search(r"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>", s)
     if m:
         title = html.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(1))).strip()
+    if not title:
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", s)
+        if m:
+            title = html.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(1))).strip()
     # 块级元素 → 换行
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</(p|div|h[1-6]|li|tr|blockquote)>", "\n", s)
@@ -278,6 +282,30 @@ def load_html_file(path):
     chapters = scan_chapters(text)
     return text, chapters, title
 
+def load_kindle(path):
+    """解析 Kindle 格式（mobi/azw/azw3/prc）→ (全文, 章节, 书名)。
+    KF8 (azw3) 会被解成 epub 复用现有解析，旧版 mobi 解成 html。"""
+    try:
+        import mobi
+    except Exception as e:
+        raise RuntimeError("未安装 mobi 库，请执行：pip install mobi") from e
+    try:
+        from loguru import logger as _mobi_logger
+        _mobi_logger.remove()        # 关闭 kindleunpack 的调试日志输出
+    except Exception:
+        pass
+    try:
+        _tempdir, out = mobi.extract(path)
+    except Exception as e:
+        raise RuntimeError(
+            "无法解析此 Kindle 文件（若为带 DRM 保护的官方电子书，请先用 Calibre 去除保护）：" + str(e)) from e
+    ext = os.path.splitext(out)[1].lower()
+    if ext == ".epub":
+        return load_epub(out)        # KF8 (azw3) → epub
+    if ext in (".html", ".htm"):
+        return load_html_file(out)   # 旧版 mobi/azw/prc → html
+    raise RuntimeError("此 Kindle 文件为 PDF 型（Print Replica），暂不支持，请先转换为 EPUB")
+
 # ============ 后台加载（不阻塞 UI） ============
 class BookLoader(QObject):
     loaded = Signal(str, list, str)   # (全文, 章节, 书名)
@@ -295,6 +323,11 @@ class BookLoader(QObject):
             elif ext in (".html", ".htm"):
                 self.progress.emit(10, "读取文件…")
                 text, chapters, title = load_html_file(self.path)
+            elif ext in (".mobi", ".azw", ".azw3", ".azw8", ".prc"):
+                self.progress.emit(10, "解析 Kindle 文件…")
+                text, chapters, title = load_kindle(self.path)
+            elif ext == ".kfx":
+                raise RuntimeError("暂不支持 KFX 格式，请先用 Calibre 转换为 EPUB 或 MOBI")
             else:
                 self.progress.emit(5, "读取文件…")
                 with open(self.path, "rb") as f:
@@ -340,7 +373,8 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "api_key": "", "api_base": "https://api.openai.com/v1",
                   "model": "gpt-4o-mini",
                   "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%",
-                  "theme": DEFAULT_THEME, "recent": []}
+                  "theme": DEFAULT_THEME, "recent": [],
+                  "bilingual": False, "bilingual_target": "中文"}
 
 def default_cjk_font() -> str:
     """优先选一个好看的中文阅读字体。"""
@@ -357,19 +391,26 @@ def default_cjk_font() -> str:
     return ""
 
 def call_llm(prompt, cfg):
-    if not cfg.get("api_key"):
+    key = (cfg.get("api_key") or "").strip()
+    if not key:
         raise RuntimeError("未配置 API Key（工具栏→设置）")
-    payload = {"model": cfg["model"], "messages": [{"role": "user", "content": prompt}],
+    base = (cfg.get("api_base") or "https://api.openai.com/v1").strip().rstrip("/")
+    payload = {"model": (cfg.get("model") or "").strip(), "messages": [{"role": "user", "content": prompt}],
                "temperature": 0.2}
     req = urllib.request.Request(
-        cfg["api_base"].rstrip("/") + "/chat/completions",
+        base + "/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + cfg["api_key"]})
+                 "Authorization": "Bearer " + key})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())["choices"][0]["message"]["content"]
 
 def translate(text, cfg):
+    return call_llm(f"把下面这段小说文本翻译成简体中文，只输出译文：\n{text}", cfg)
+
+def translate_to(text, cfg, target="中文"):
+    if target == "英文":
+        return call_llm(f"把下面这段小说文本翻译成地道的英文，只输出译文：\n{text}", cfg)
     return call_llm(f"把下面这段小说文本翻译成简体中文，只输出译文：\n{text}", cfg)
 
 def lookup(word, cfg):
@@ -398,6 +439,11 @@ TTS_VOICES = [
     ("晓妮（陕西女声）", "zh-CN-shaanxi-XiaoniNeural"),
     ("晓臻（台湾女声）", "zh-TW-HsiaoChenNeural"),
     ("云哲（台湾男声）", "zh-TW-YunJheNeural"),
+    ("Aria（英文·美式·女）", "en-US-AriaNeural"),
+    ("Jenny（英文·美式·女）", "en-US-JennyNeural"),
+    ("Guy（英文·美式·男）", "en-US-GuyNeural"),
+    ("Sonia（英文·英式·女）", "en-GB-SoniaNeural"),
+    ("Ryan（英文·英式·男）", "en-GB-RyanNeural"),
 ]
 TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
 TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
@@ -473,6 +519,18 @@ class TtsWorker(QObject):
             self.ready.emit(self.seq, synthesize_tts(self.text, self.voice, self.rate))
         except Exception as e:
             self.failed.emit(str(e))
+
+class TranslateWorker(QObject):
+    done = Signal(int, str)        # (句子序号, 译文)
+    failed = Signal(int, str)      # (句子序号, 错误信息)
+    def __init__(self, seq, text, cfg, target):
+        super().__init__()
+        self.seq, self.text, self.cfg, self.target = seq, text, cfg, target
+    def run(self):
+        try:
+            self.done.emit(self.seq, translate_to(self.text, self.cfg, self.target))
+        except Exception as e:
+            self.failed.emit(self.seq, str(e))
 
 # ============ 双页视图（显示"当前章节"的页） ============
 class PageView(QWidget):
@@ -873,6 +931,13 @@ class SettingsDialog(QDialog):
         self.tts_rate.addItems(TTS_RATES)
         ri = self.tts_rate.findText(cfg.get("tts_rate", "+0%"))
         self.tts_rate.setCurrentIndex(ri if ri >= 0 else 3)
+        # 双语朗读（朗读时 AI 翻译）
+        self.bilingual = QCheckBox("朗读时自动翻译并显示")
+        self.bilingual.setChecked(bool(cfg.get("bilingual", False)))
+        self.bilingual_target = QComboBox()
+        self.bilingual_target.addItems(["中文", "英文"])
+        bi = self.bilingual_target.findText(cfg.get("bilingual_target", "中文"))
+        self.bilingual_target.setCurrentIndex(bi if bi >= 0 else 0)
         # 根据当前 base 反推预设（先设值，后连信号，避免误触发覆盖用户自定义模型）
         cur = cfg.get("api_base", "").rstrip("/")
         matched = False
@@ -900,6 +965,9 @@ class SettingsDialog(QDialog):
         form.addRow("语音朗读", QLabel("（edge-tts，需联网）"))
         form.addRow("朗读音色", self.tts_voice)
         form.addRow("朗读语速", self.tts_rate)
+        form.addRow("双语朗读", QLabel("（朗读时 AI 翻译，需 API Key）"))
+        form.addRow("双语翻译", self.bilingual)
+        form.addRow("翻译目标", self.bilingual_target)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
         form.addRow(btn)
@@ -944,6 +1012,13 @@ class MainWindow(QMainWindow):
         self.ai_dock.setWidget(right)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.ai_dock)
         self.ai_dock.hide()                              # 默认隐藏
+        self.bilingual_out = QTextEdit(); self.bilingual_out.setReadOnly(True)
+        biw = QWidget(); biv = QVBoxLayout(biw)
+        biv.addWidget(QLabel("原文 / 译文（随朗读更新）")); biv.addWidget(self.bilingual_out)
+        self.bilingual_dock = QDockWidget("🌐 双语翻译", self)
+        self.bilingual_dock.setWidget(biw)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.bilingual_dock)
+        self.bilingual_dock.hide()                       # 默认隐藏
 
         # ---- 语音朗读（edge-tts）----
         self.player = QMediaPlayer(self) if _HAS_MULTIMEDIA else None
@@ -961,6 +1036,10 @@ class MainWindow(QMainWindow):
         self.tts_inflight = set()
         self.tts_workers = {}         # seq -> TtsWorker（防止信号前被 GC）
         self.tts_buf = None
+        self.bilingual_on = bool(self.cfg.get("bilingual", False))
+        self.tr_cache = {}            # seq -> 译文
+        self.tr_inflight = set()
+        self.tr_workers = {}
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True); self._resize_timer.setInterval(200)
@@ -968,6 +1047,9 @@ class MainWindow(QMainWindow):
 
         self._build_toolbar(); self._build_menus()
         self._rebuild_recent_menu()
+        self._update_bilingual_act()
+        if self.bilingual_on:
+            self.bilingual_dock.show()
 
         # 底部状态栏：加载进度条 + 阅读进度（可拖动跳转）
         self.load_bar = QProgressBar()
@@ -1009,6 +1091,8 @@ class MainWindow(QMainWindow):
         self.tts_act = tb.addAction("🔊 朗读", self.toggle_reading)
         self.stop_act = tb.addAction("⏹ 停止", self.stop_reading)
         self.stop_act.setEnabled(False)
+        self.bilingual_act = tb.addAction("🌐 双语", self.toggle_bilingual)
+        self.bilingual_act.setCheckable(True)
         self.sleep_act = tb.addAction("⏰ 定时")
         self.sleep_act.setMenu(self._build_sleep_menu())
         tb.addSeparator()
@@ -1052,7 +1136,7 @@ class MainWindow(QMainWindow):
     def open_book(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", "",
-            "电子书 (*.txt *.md *.epub *.html *.htm);;文本 (*.txt *.md);;EPUB (*.epub);;网页 (*.html *.htm)")
+            "电子书 (*.txt *.md *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc);;文本 (*.txt *.md);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm)")
         if path:
             self.load_book(path)
 
@@ -1176,7 +1260,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.cfg.update({
-                "api_key": dlg.key.text(), "api_base": dlg.base.text(), "model": dlg.model.text(),
+                "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(), "model": dlg.model.text().strip(),
                 "font_family": dlg.font_family.currentData(),
                 "font_size": dlg.font_size.value(), "line_spacing": dlg.line_spacing.value(),
                 "para_spacing": dlg.para_spacing.value(),
@@ -1185,9 +1269,17 @@ class MainWindow(QMainWindow):
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
                 "theme": dlg.theme.currentText(),
+                "bilingual": dlg.bilingual.isChecked(),
+                "bilingual_target": dlg.bilingual_target.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
             self.view.set_theme(THEMES.get(self.cfg["theme"], THEMES[DEFAULT_THEME]))
+            self.bilingual_on = bool(self.cfg["bilingual"])
+            if self.bilingual_on:
+                self.bilingual_dock.show()
+            else:
+                self.bilingual_dock.hide()
+            self._update_bilingual_act()
             self.reload_current()
 
     def _show_ctx_menu(self, pos):
@@ -1206,6 +1298,76 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.ai_out.setPlainText)
         self.worker.failed.connect(lambda m: self.ai_out.setPlainText("出错：" + m))
         threading.Thread(target=self.worker.run, daemon=True).start()
+
+    # ---- 双语翻译（朗读时 AI 翻译）----
+    def toggle_bilingual(self):
+        if not self.cfg.get("api_key"):
+            self.statusBar().showMessage("双语翻译需要先配置 API Key（工具栏→设置）")
+            self.bilingual_act.setChecked(False)
+            return
+        self.bilingual_on = not self.bilingual_on
+        self.cfg["bilingual"] = self.bilingual_on
+        save_json(CONFIG_PATH, self.cfg)
+        if self.bilingual_on:
+            self.bilingual_dock.show()
+        else:
+            self.bilingual_dock.hide()
+        self._update_bilingual_act()
+
+    def _update_bilingual_act(self):
+        self.bilingual_act.setChecked(self.bilingual_on)
+
+    def _tr_kick(self, seq):
+        if not self.bilingual_on or seq < 0 or seq >= len(self.tts_sentences):
+            return
+        if seq in self.tr_inflight or seq in self.tr_cache:
+            return
+        _, _, text = self.tts_sentences[seq]
+        clean = re.sub(r"\s+", " ", text).strip()
+        if not clean:
+            return
+        self.tr_inflight.add(seq)
+        epoch = self.tts_epoch
+        w = TranslateWorker(seq, clean, self.cfg, self.cfg.get("bilingual_target", "中文"))
+        w.done.connect(lambda s, t, ep=epoch: self._tr_on_done(ep, s, t))
+        w.failed.connect(lambda s, m, ep=epoch: self._tr_on_failed(ep, s, m))
+        self.tr_workers[seq] = w
+        threading.Thread(target=w.run, daemon=True).start()
+
+    def _tr_on_done(self, epoch, seq, translated):
+        if epoch != self.tts_epoch:
+            return
+        self.tr_inflight.discard(seq)
+        self.tr_workers.pop(seq, None)
+        self.tr_cache[seq] = translated
+        if seq == self.tts_idx and self.bilingual_on:
+            self._update_bilingual(seq)
+
+    def _tr_on_failed(self, epoch, seq, msg):
+        if epoch != self.tts_epoch:
+            return
+        self.tr_inflight.discard(seq)
+        self.tr_workers.pop(seq, None)
+        if "401" in msg or "Authorization" in msg:
+            hint = "API Key 无效，请到 工具栏→设置 重新填写"
+        elif "未配置 API Key" in msg:
+            hint = "未配置 API Key（工具栏→设置）"
+        else:
+            hint = msg[:120]
+        self.tr_cache[seq] = f"（翻译失败：{hint}）"
+        if seq == self.tts_idx and self.bilingual_on:
+            self._update_bilingual(seq)
+
+    def _update_bilingual(self, seq):
+        if not self.bilingual_on or seq < 0 or seq >= len(self.tts_sentences):
+            return
+        _, _, text = self.tts_sentences[seq]
+        clean = re.sub(r"\s+", " ", text).strip()
+        tr = self.tr_cache.get(seq)
+        if tr is None:
+            self.bilingual_out.setPlainText(f"原文：{clean}\n\n译文：（翻译中…）")
+        else:
+            self.bilingual_out.setPlainText(f"原文：{clean}\n\n译文：{tr}")
 
     # ---- 语音朗读（edge-tts）----
     def toggle_reading(self):
@@ -1255,6 +1417,7 @@ class MainWindow(QMainWindow):
         self.tts_sentences = sents
         self.tts_epoch += 1            # 换章：旧缓存/在途结果全部作废
         self.tts_cache.clear(); self.tts_inflight.clear(); self.tts_workers.clear()
+        self.tr_cache.clear(); self.tr_inflight.clear(); self.tr_workers.clear()
         return bool(sents)
 
     def _tts_next_chapter(self):
@@ -1273,6 +1436,9 @@ class MainWindow(QMainWindow):
         self._reveal_offset(s)
         self.statusBar().showMessage(
             f"🔊 朗读中 · 第{self.tts_chapter + 1}章 · {seq + 1}/{len(self.tts_sentences)}句")
+        if self.bilingual_on:
+            self._update_bilingual(seq)
+            self._tr_kick(seq)
         data = self.tts_cache.pop(seq, None)
         if data is not None:
             self._tts_play_data(seq, data)
@@ -1281,6 +1447,8 @@ class MainWindow(QMainWindow):
         nxt = seq + 1
         if nxt < len(self.tts_sentences) and nxt not in self.tts_cache and nxt not in self.tts_inflight:
             self._tts_kick(nxt)
+        if self.bilingual_on and nxt < len(self.tts_sentences):
+            self._tr_kick(nxt)
 
     def _tts_kick(self, seq):
         if seq in self.tts_inflight or seq in self.tts_cache:
@@ -1351,6 +1519,7 @@ class MainWindow(QMainWindow):
         self.tts_epoch += 1
         self.tts_sentences = []
         self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
+        self.tr_cache = {}; self.tr_inflight = set(); self.tr_workers = {}
         if self.player:
             self.player.stop()
         self.tts_buf = None
