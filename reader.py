@@ -1,6 +1,6 @@
 # reader.py —— 基于 PySide6 的文本小说阅读器（支持大文件惰性分页）
 # 双击 start.bat 或命令行:  python reader.py 小说.txt
-import sys, json, re, os, threading, bisect, urllib.request, asyncio, time, zipfile, posixpath, html
+import sys, json, re, os, threading, bisect, urllib.request, asyncio, time, zipfile, posixpath, html, io, wave
 from urllib.parse import unquote
 import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional
@@ -282,6 +282,32 @@ def load_html_file(path):
     chapters = scan_chapters(text)
     return text, chapters, title
 
+def load_pdf(path):
+    """解析 PDF（仅限有文字层的，不支持扫描版）→ (全文, 章节, 书名)。
+    按原始页面逐页提取文字后拼接，不保留 PDF 原本的分页/排版 -- 交给
+    LazyPager 按字符重新分页，跟 epub/html/txt 走同一套流程。"""
+    try:
+        import pymupdf
+    except Exception as e:
+        raise RuntimeError("未安装 PyMuPDF，请执行：pip install pymupdf") from e
+    doc = pymupdf.open(path)
+    try:
+        title = (doc.metadata or {}).get("title", "") or ""
+        parts = []
+        for page in doc:
+            t = page.get_text("text")
+            if t and t.strip():
+                parts.append(t.strip())
+        if not parts:
+            raise RuntimeError("此 PDF 没有可提取的文字层（可能是扫描版/图片 PDF，暂不支持，需要 OCR）")
+    finally:
+        doc.close()
+    text = "\n\n".join(parts)
+    text = re.sub(r"[ \t\r]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    chapters = scan_chapters(text)
+    return text, chapters, title.strip()
+
 def load_kindle(path):
     """解析 Kindle 格式（mobi/azw/azw3/prc）→ (全文, 章节, 书名)。
     KF8 (azw3) 会被解成 epub 复用现有解析，旧版 mobi 解成 html。"""
@@ -326,6 +352,9 @@ class BookLoader(QObject):
             elif ext in (".mobi", ".azw", ".azw3", ".azw8", ".prc"):
                 self.progress.emit(10, "解析 Kindle 文件…")
                 text, chapters, title = load_kindle(self.path)
+            elif ext == ".pdf":
+                self.progress.emit(10, "解析 PDF…")
+                text, chapters, title = load_pdf(self.path)
             elif ext == ".kfx":
                 raise RuntimeError("暂不支持 KFX 格式，请先用 Calibre 转换为 EPUB 或 MOBI")
             else:
@@ -446,9 +475,84 @@ TTS_VOICES = [
     ("Ryan（英文·英式·男）", "en-GB-RyanNeural"),
     ("Nanami（日文·女）", "ja-JP-NanamiNeural"),
     ("Keita（日文·男）", "ja-JP-KeitaNeural"),
+    ("Huayan（中文·离线，无需联网）", "piper:zh_CN-huayan-medium"),
+    ("Lessac（英文·离线，无需联网）", "piper:en_US-lessac-medium"),
 ]
 TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
 TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+
+# Piper 离线语音：voice id -> Hugging Face piper-voices 仓库里的路径前缀
+PIPER_VOICES = {
+    "zh_CN-huayan-medium": "zh/zh_CN/huayan/medium",
+    "en_US-lessac-medium": "en/en_US/lessac/medium",
+}
+PIPER_MODEL_BASE_URL = "https://hf-mirror.com/rhasspy/piper-voices/resolve/main"
+_piper_voice_cache = {}
+_piper_voice_cache_lock = threading.Lock()
+
+def _piper_model_dir():
+    d = os.path.join(APP_DIR, "piper_models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _ensure_piper_model(voice_id: str) -> str:
+    """确保 voice_id 对应的 Piper 模型文件（.onnx + .onnx.json）已下载到本地，返回 onnx 路径。"""
+    if voice_id not in PIPER_VOICES:
+        raise RuntimeError(f"未知的离线语音：{voice_id}")
+    d = _piper_model_dir()
+    onnx_path = os.path.join(d, f"{voice_id}.onnx")
+    cfg_path = onnx_path + ".json"
+    prefix = PIPER_VOICES[voice_id]
+    if not (os.path.isfile(onnx_path) and os.path.isfile(cfg_path)):
+        _log_tts(f"[离线朗读] 首次使用，正在下载模型：{voice_id}（约 60MB，需联网一次）")
+        for path, url in ((onnx_path, f"{PIPER_MODEL_BASE_URL}/{prefix}/{voice_id}.onnx"),
+                          (cfg_path, f"{PIPER_MODEL_BASE_URL}/{prefix}/{voice_id}.onnx.json")):
+            tmp = path + ".part"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                    out.write(resp.read())
+                os.replace(tmp, path)
+            except Exception as e:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError(f"离线语音模型下载失败：{e}") from e
+    return onnx_path
+
+def _piper_rate_to_length_scale(rate: str) -> float:
+    """把 edge-tts 风格的 "+10%"/"-25%" 语速转成 Piper 的 length_scale（越大越慢）。"""
+    try:
+        pct = int(str(rate).strip().replace("%", ""))
+    except Exception:
+        pct = 0
+    pct = max(-90, min(200, pct))
+    return 1.0 / (1.0 + pct / 100.0)
+
+def _load_piper_voice(voice_id: str):
+    with _piper_voice_cache_lock:
+        voice = _piper_voice_cache.get(voice_id)
+        if voice is not None:
+            return voice
+        try:
+            from piper import PiperVoice
+        except Exception as e:
+            raise RuntimeError("未安装 piper-tts，请执行：pip install piper-tts") from e
+        onnx_path = _ensure_piper_model(voice_id)
+        voice = PiperVoice.load(onnx_path)
+        _piper_voice_cache[voice_id] = voice
+        return voice
+
+def synthesize_tts_piper(text: str, voice_id: str, rate: str) -> bytes:
+    """离线合成（Piper），返回 wav 字节。"""
+    from piper import SynthesisConfig
+    voice = _load_piper_voice(voice_id)
+    syn_config = SynthesisConfig(length_scale=_piper_rate_to_length_scale(rate))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+    return buf.getvalue()
 
 def split_sentences(text: str, base: int = 0):
     """把文本切成句子：返回 [(起始偏移, 结束偏移, 句子文本)]，偏移为全局字符偏移。"""
@@ -475,7 +579,10 @@ def split_sentences(text: str, base: int = 0):
     return res
 
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
-    """把一段文本合成 mp3 字节（edge-tts，直连，带重试）。"""
+    """把一段文本合成音频字节。voice 以 "piper:" 开头走本地离线合成（wav），
+    否则走 edge-tts 云端合成（mp3，直连，带重试）。"""
+    if voice.startswith("piper:"):
+        return synthesize_tts_piper(text, voice[len("piper:"):], rate)
     try:
         import edge_tts
     except Exception as e:
@@ -1138,7 +1245,7 @@ class MainWindow(QMainWindow):
     def open_book(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", "",
-            "电子书 (*.txt *.md *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc);;文本 (*.txt *.md);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm)")
+            "电子书 (*.txt *.md *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc *.pdf);;文本 (*.txt *.md);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf)")
         if path:
             self.load_book(path)
 
