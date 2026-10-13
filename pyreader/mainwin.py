@@ -37,7 +37,8 @@ class MainWindow(QMainWindow):
         _saved = load_json(CONFIG_PATH, {})
         _env   = load_env_defaults() if not _saved.get("api_key") else {}
         self.cfg = {**DEFAULT_CONFIG, **_env, **_saved}
-        set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"])
+        set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
+                         self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
         if self.cfg.get("tts_voice") not in {v for _, v in TTS_VOICES}:   # 已下线的 edge-tts 音色 → 默认音色
             self.cfg["tts_voice"] = TTS_DEFAULT_VOICE
         self.bookmarks = load_json(BOOKMARKS_PATH, {})
@@ -495,13 +496,16 @@ class MainWindow(QMainWindow):
                 "tts_rate": dlg.tts_rate.currentText(),
                 "azure_tts_key": dlg.azure_key.text().strip(),
                 "azure_tts_region": dlg.azure_region.text().strip(),
+                "azure_tts_key2": dlg.azure_key2.text().strip(),
+                "azure_tts_region2": dlg.azure_region2.text().strip(),
                 "theme": dlg.theme.currentText(),
                 "flip_effect": dlg.flip_effect.currentText(),
                 "bilingual": dlg.bilingual.isChecked(),
                 "bilingual_target": dlg.bilingual_target.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
-            set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"])
+            set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
+                         self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
             self._apply_theme(self.cfg["theme"])
             self.view._flip_effect = self.cfg["flip_effect"]
             self.bilingual_on = bool(self.cfg["bilingual"])

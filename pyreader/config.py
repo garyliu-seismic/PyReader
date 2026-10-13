@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "api_version": "",
                   "tts_voice": "sherpa:melo-zh_en", "tts_rate": "+0%",
                   "azure_tts_key": "", "azure_tts_region": "",
+                  "azure_tts_key2": "", "azure_tts_region2": "",
                   "theme": DEFAULT_THEME, "recent": [],
                   "bilingual": False, "bilingual_target": "中文",
                   "flip_effect": DEFAULT_FLIP_EFFECT}

@@ -272,16 +272,27 @@ def split_sentences(text: str, base: int = 0):
             res.append((base + seg_start, base + n, seg))
     return res
 
-# Azure Speech（REST，无需 SDK）。Key/区域由设置对话框写入，也可用环境变量 AZURE_SPEECH_KEY / AZURE_SPEECH_REGION。
-_azure_cfg = {"key": "", "region": ""}
-AZURE_FREE_QUOTA = 500_000   # F0 每月免费字符数
+# Azure Speech（REST，无需 SDK）。账号 0 为主、1 为备用；Key/区域由设置对话框写入，
+# 主账号也可用环境变量 AZURE_SPEECH_KEY / AZURE_SPEECH_REGION。
+_azure_accounts = [{"key": "", "region": ""}, {"key": "", "region": ""}]
+_azure_skip_until = [0.0, 0.0]   # 账号额度用尽/认证失败后，暂时跳过的截止时间（秒级时间戳）
+AZURE_FREE_QUOTA = 500_000       # F0 每月免费字符数
+AZURE_SKIP_SECONDS = 600
 
-def set_azure_config(key: str, region: str):
-    _azure_cfg["key"] = (key or "").strip()
-    _azure_cfg["region"] = (region or "").strip().lower()
+def _norm_region(region: str) -> str:
+    """接受 'eastus' 或完整端点 URL（https://eastus.api.cognitive.microsoft.com/），统一成区域名。"""
+    import re
+    r = (region or "").strip().lower()
+    m = re.match(r"https?://([a-z0-9-]+)\.", r)
+    return m.group(1) if m else r
 
-def _azure_usage_add(text: str):
-    """按 Azure 计费口径累计本月字符数（中日韩字符每个算 2），接近免费额度时写日志告警。"""
+def set_azure_config(key: str, region: str, key2: str = "", region2: str = ""):
+    _azure_accounts[0] = {"key": (key or "").strip(), "region": _norm_region(region)}
+    _azure_accounts[1] = {"key": (key2 or "").strip(), "region": _norm_region(region2)}
+    _azure_skip_until[0] = _azure_skip_until[1] = 0.0
+
+def _azure_usage_add(idx: int, text: str):
+    """按 Azure 计费口径累计各账号本月字符数（中日韩字符每个算 2），接近免费额度时写日志告警。"""
     import json
     billed = sum(2 if ("⺀" <= c <= "鿿" or "가" <= c <= "힯" or "＀" <= c <= "￯") else 1
                  for c in text)
@@ -292,24 +303,27 @@ def _azure_usage_add(text: str):
             data = json.load(f)
     except Exception:
         data = {}
-    used = data.get(month, 0) + billed
+    cur = data.get(month, {})
+    if not isinstance(cur, dict):          # 兼容旧格式 {"2026-10": 51}
+        cur = {"0": cur}
+    used = cur.get(str(idx), 0) + billed
+    cur[str(idx)] = used
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({month: used}, f)
+            json.dump({month: cur}, f)
     except Exception:
         pass
     if used >= AZURE_FREE_QUOTA * 0.8:
-        _log_tts(f"[Azure] 本月已用约 {used} / {AZURE_FREE_QUOTA} 字符（免费额度的 {used * 100 // AZURE_FREE_QUOTA}%）")
+        _log_tts(f"[Azure] 账号{idx}本月已用约 {used} / {AZURE_FREE_QUOTA} 字符（免费额度的 {used * 100 // AZURE_FREE_QUOTA}%）")
 
-def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
-    """Azure Speech 云端合成，返回 mp3 字节。429/5xx 退避重试，401/403 直接报错。"""
+class _AzureAccountError(Exception):
+    """账号级错误（认证失败 / 额度用尽 / 持续限流），应切换到下一个账号。"""
+
+def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> bytes:
     import re
     import urllib.error
     from xml.sax.saxutils import escape
-    key = _azure_cfg["key"] or os.environ.get("AZURE_SPEECH_KEY", "")
-    region = _azure_cfg["region"] or os.environ.get("AZURE_SPEECH_REGION", "").strip().lower()
-    if not key or not region:
-        raise RuntimeError("未配置 Azure Speech：请在设置里填写 Key 和区域（如 eastus）")
+    key, region = acct["key"], acct["region"]
     if not re.fullmatch(r"[a-z0-9-]+", region):   # region 会拼进主机名，Key 会发往该主机，必须严格校验
         raise RuntimeError(f"Azure 区域格式不正确：{region!r}")
     lang = "-".join(voice_name.split("-")[:2])
@@ -326,17 +340,41 @@ def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
                 data = resp.read()
             if not data:
                 raise RuntimeError("Azure 未返回音频")
-            _azure_usage_add(text)
+            _azure_usage_add(idx, text)
             return data
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                raise RuntimeError(f"Azure Speech 认证失败（HTTP {e.code}），请检查 Key 和区域") from e
+                raise _AzureAccountError(f"认证失败或额度用尽（HTTP {e.code}）") from e
             last_err = e
         except Exception as e:
             last_err = e
-        _log_tts(f"[Azure重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{last_err}")
+        _log_tts(f"[Azure重试] 账号{idx} 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{last_err}")
         time.sleep(1.0 * (attempt + 1))
+    if isinstance(last_err, urllib.error.HTTPError) and last_err.code == 429:
+        raise _AzureAccountError("持续被限流（HTTP 429）") from last_err
     raise RuntimeError(f"Azure 语音合成失败（已重试3次）：{last_err}")
+
+def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
+    """Azure Speech 云端合成，返回 mp3 字节。主账号认证失败/额度用尽/持续限流时自动切换备用账号，
+    出问题的账号会被暂时跳过一段时间，避免每句都先撞一次错误。"""
+    accts = [dict(a) for a in _azure_accounts]
+    if not accts[0]["key"]:
+        accts[0] = {"key": os.environ.get("AZURE_SPEECH_KEY", "").strip(),
+                    "region": _norm_region(os.environ.get("AZURE_SPEECH_REGION", ""))}
+    cand = [i for i, a in enumerate(accts) if a["key"] and a["region"]]
+    if not cand:
+        raise RuntimeError("未配置 Azure Speech：请在设置里填写 Key 和区域（如 eastus）")
+    now = time.time()
+    order = [i for i in cand if _azure_skip_until[i] <= now] or cand   # 都在冷却期则全部再试一遍
+    errors = []
+    for i in order:
+        try:
+            return _azure_call(i, accts[i], voice_name, text, rate)
+        except _AzureAccountError as e:
+            _azure_skip_until[i] = time.time() + AZURE_SKIP_SECONDS
+            _log_tts(f"[Azure] 账号{i} 不可用，{AZURE_SKIP_SECONDS // 60} 分钟内跳过：{e}")
+            errors.append(f"账号{i}：{e}")
+    raise RuntimeError("Azure Speech 所有账号均不可用，请检查 Key、区域和额度（" + "；".join(errors) + "）")
 
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
     """把一段文本合成音频字节。voice 以 "sherpa:" 走本地 Melo 离线合成（wav，中英混读），
