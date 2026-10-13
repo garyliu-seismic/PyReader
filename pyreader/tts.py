@@ -3,40 +3,144 @@ import io
 import wave
 import time
 import threading
-import asyncio
 import urllib.request
 from PySide6.QtCore import QObject, Signal
 from .config import APP_DIR
 from .ai import translate_to
 
-# ============ 语音朗读（edge-tts） ============
+# ============ 语音朗读（Melo 离线 / Azure Speech / Piper 离线英文） ============
 TTS_VOICES = [
-    ("晓晓（女·温柔，默认）", "zh-CN-XiaoxiaoNeural"),
-    ("晓伊（女·活泼）", "zh-CN-XiaoyiNeural"),
-    ("晓墨（女·可爱）", "zh-CN-XiaomoNeural"),
-    ("云希（男·少年）", "zh-CN-YunxiNeural"),
-    ("云扬（男·新闻）", "zh-CN-YunyangNeural"),
-    ("云健（男）", "zh-CN-YunjianNeural"),
-    ("晓北（东北女声）", "zh-CN-liaoning-XiaobeiNeural"),
-    ("晓妮（陕西女声）", "zh-CN-shaanxi-XiaoniNeural"),
-    ("晓臻（台湾女声）", "zh-TW-HsiaoChenNeural"),
-    ("云哲（台湾男声）", "zh-TW-YunJheNeural"),
-    ("Aria（英文·美式·女）", "en-US-AriaNeural"),
-    ("Jenny（英文·美式·女）", "en-US-JennyNeural"),
-    ("Guy（英文·美式·男）", "en-US-GuyNeural"),
-    ("Sonia（英文·英式·女）", "en-GB-SoniaNeural"),
-    ("Ryan（英文·英式·男）", "en-GB-RyanNeural"),
-    ("Nanami（日文·女）", "ja-JP-NanamiNeural"),
-    ("Keita（日文·男）", "ja-JP-KeitaNeural"),
-    ("Huayan（中文·离线，无需联网）", "piper:zh_CN-huayan-medium"),
+    ("Melo（中英混读·女·离线，默认）", "sherpa:melo-zh_en"),
     ("Lessac（英文·离线，无需联网）", "piper:en_US-lessac-medium"),
+    # Azure Speech（官方接口，需在设置里填 Key 和区域；F0 免费层每月 50 万字符，中日韩每字按 2 计）
+    ("Nanami（日文·女·Azure）", "azure:ja-JP-NanamiNeural"),
+    ("Keita（日文·男·Azure）", "azure:ja-JP-KeitaNeural"),
+    ("SunHi（韩文·女·Azure）", "azure:ko-KR-SunHiNeural"),
+    ("InJoon（韩文·男·Azure）", "azure:ko-KR-InJoonNeural"),
+    ("Denise（法文·女·Azure）", "azure:fr-FR-DeniseNeural"),
+    ("Henri（法文·男·Azure）", "azure:fr-FR-HenriNeural"),
+    ("Katja（德文·女·Azure）", "azure:de-DE-KatjaNeural"),
+    ("Conrad（德文·男·Azure）", "azure:de-DE-ConradNeural"),
+    ("Elvira（西班牙文·女·Azure）", "azure:es-ES-ElviraNeural"),
+    ("Alvaro（西班牙文·男·Azure）", "azure:es-ES-AlvaroNeural"),
+    ("晓晓（中文·女·温柔·Azure）", "azure:zh-CN-XiaoxiaoNeural"),
+    ("晓伊（中文·女·活泼·Azure）", "azure:zh-CN-XiaoyiNeural"),
+    ("云希（中文·男·少年·Azure）", "azure:zh-CN-YunxiNeural"),
+    ("云扬（中文·男·新闻·Azure）", "azure:zh-CN-YunyangNeural"),
+    ("云健（中文·男·Azure）", "azure:zh-CN-YunjianNeural"),
+    ("Jenny（英文·美式·女·Azure）", "azure:en-US-JennyNeural"),
+    ("Aria（英文·美式·女·Azure）", "azure:en-US-AriaNeural"),
+    ("Guy（英文·美式·男·Azure）", "azure:en-US-GuyNeural"),
+    ("Sonia（英文·英式·女·Azure）", "azure:en-GB-SoniaNeural"),
+    ("Ryan（英文·英式·男·Azure）", "azure:en-GB-RyanNeural"),
 ]
 TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
-TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+TTS_DEFAULT_VOICE = "sherpa:melo-zh_en"
+
+# Sherpa-ONNX 离线语音（vits-melo-tts-zh_en，MIT，中英混读）。
+# 模型文件从 hf-mirror.com 逐个下载到 ~/.pyreader/sherpa_models/（huggingface.co 在本机会被重置连接）。
+SHERPA_MELO_ID = "melo-zh_en"
+SHERPA_MELO_DIR = "vits-melo-tts-zh_en"
+SHERPA_MELO_BASE_URL = "https://hf-mirror.com/csukuangfj/vits-melo-tts-zh_en/resolve/main"
+SHERPA_MELO_FILES = [
+    "model.onnx", "lexicon.txt", "tokens.txt",
+    "date.fst", "number.fst", "phone.fst", "new_heteronym.fst",
+    "dict/jieba.dict.utf8", "dict/hmm_model.utf8", "dict/idf.utf8",
+    "dict/stop_words.utf8", "dict/user.dict.utf8",
+    "dict/pos_dict/char_state_tab.utf8", "dict/pos_dict/prob_emit.utf8",
+    "dict/pos_dict/prob_start.utf8", "dict/pos_dict/prob_trans.utf8",
+]
+_sherpa_tts = None
+_sherpa_lock = threading.Lock()   # 同时保护模型加载和合成调用
+
+def sherpa_model_ready() -> bool:
+    return os.path.isfile(os.path.join(APP_DIR, "sherpa_models", SHERPA_MELO_DIR, ".complete"))
+
+def _ensure_sherpa_model() -> str:
+    """确保 Melo 模型文件齐全（约 190MB，首次需联网），返回模型目录。镜像单文件偶发失败，逐个重试。"""
+    d = os.path.join(APP_DIR, "sherpa_models", SHERPA_MELO_DIR)
+    ok_flag = os.path.join(d, ".complete")
+    if os.path.isfile(ok_flag):
+        return d
+    _log_tts("[离线朗读] 首次使用，正在下载 Melo 模型（约 190MB，需联网一次）")
+    for rel in SHERPA_MELO_FILES:
+        path = os.path.join(d, *rel.split("/"))
+        if os.path.isfile(path):
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        last_err = None
+        for attempt in range(5):
+            try:
+                req = urllib.request.Request(f"{SHERPA_MELO_BASE_URL}/{rel}", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                os.replace(tmp, path)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                time.sleep(1.0 * (attempt + 1))
+        if last_err is not None:
+            raise RuntimeError(f"离线语音模型下载失败（{rel}）：{last_err}") from last_err
+    with open(ok_flag, "w") as f:
+        f.write("ok")
+    return d
+
+def _load_sherpa_tts():
+    """调用方须已持有 _sherpa_lock。"""
+    global _sherpa_tts
+    if _sherpa_tts is not None:
+        return _sherpa_tts
+    try:
+        import sherpa_onnx
+    except Exception as e:
+        raise RuntimeError("未安装 sherpa-onnx，请执行：pip install sherpa-onnx") from e
+    d = _ensure_sherpa_model().replace("\\", "/")   # 路径用正斜杠，避免被当成转义字符
+    cfg = sherpa_onnx.OfflineTtsConfig(
+        model=sherpa_onnx.OfflineTtsModelConfig(
+            vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                model=f"{d}/model.onnx", lexicon=f"{d}/lexicon.txt",
+                tokens=f"{d}/tokens.txt", dict_dir=f"{d}/dict"),
+            provider="cpu", num_threads=4, debug=False),
+        rule_fsts=",".join(f"{d}/{f}" for f in ("date.fst", "phone.fst", "number.fst", "new_heteronym.fst")),
+        max_num_sentences=1)
+    _sherpa_tts = sherpa_onnx.OfflineTts(cfg)
+    return _sherpa_tts
+
+def _rate_to_speed(rate: str) -> float:
+    """把 "+10%"/"-25%" 语速转成 Sherpa 的 speed（越大越快）。"""
+    try:
+        pct = int(str(rate).strip().replace("%", ""))
+    except Exception:
+        pct = 0
+    return max(0.5, min(3.0, 1.0 + pct / 100.0))
+
+def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
+    """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。"""
+    import numpy as np
+    with _sherpa_lock:
+        tts = _load_sherpa_tts()
+        g = tts.generate(text, sid=0, speed=_rate_to_speed(rate))
+    if not len(g.samples):
+        raise RuntimeError("Melo 未返回音频")
+    pcm = (np.clip(np.asarray(g.samples, dtype=np.float32), -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(g.sample_rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
 
 # Piper 离线语音：voice id -> Hugging Face piper-voices 仓库里的路径前缀
 PIPER_VOICES = {
-    "zh_CN-huayan-medium": "zh/zh_CN/huayan/medium",
     "en_US-lessac-medium": "en/en_US/lessac/medium",
 }
 PIPER_MODEL_BASE_URL = "https://hf-mirror.com/rhasspy/piper-voices/resolve/main"
@@ -75,7 +179,7 @@ def _ensure_piper_model(voice_id: str) -> str:
     return onnx_path
 
 def _piper_rate_to_length_scale(rate: str) -> float:
-    """把 edge-tts 风格的 "+10%"/"-25%" 语速转成 Piper 的 length_scale（越大越慢）。"""
+    """把 "+10%"/"-25%" 语速转成 Piper 的 length_scale（越大越慢）。"""
     try:
         pct = int(str(rate).strip().replace("%", ""))
     except Exception:
@@ -168,24 +272,83 @@ def split_sentences(text: str, base: int = 0):
             res.append((base + seg_start, base + n, seg))
     return res
 
-def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
-    """把一段文本合成音频字节。voice 以 "piper:" 开头走本地离线合成（wav），
-    否则走 edge-tts 云端合成（mp3，直连，带重试）。"""
-    if voice.startswith("piper:"):
-        return synthesize_tts_piper(text, voice[len("piper:"):], rate)
+# Azure Speech（REST，无需 SDK）。Key/区域由设置对话框写入，也可用环境变量 AZURE_SPEECH_KEY / AZURE_SPEECH_REGION。
+_azure_cfg = {"key": "", "region": ""}
+AZURE_FREE_QUOTA = 500_000   # F0 每月免费字符数
+
+def set_azure_config(key: str, region: str):
+    _azure_cfg["key"] = (key or "").strip()
+    _azure_cfg["region"] = (region or "").strip().lower()
+
+def _azure_usage_add(text: str):
+    """按 Azure 计费口径累计本月字符数（中日韩字符每个算 2），接近免费额度时写日志告警。"""
+    import json
+    billed = sum(2 if ("⺀" <= c <= "鿿" or "가" <= c <= "힯" or "＀" <= c <= "￯") else 1
+                 for c in text)
+    path = os.path.join(APP_DIR, "azure_usage.json")
+    month = time.strftime("%Y-%m")
     try:
-        import edge_tts
-    except Exception as e:
-        raise RuntimeError("未安装 edge-tts，请执行：pip install edge-tts") from e
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    used = data.get(month, 0) + billed
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({month: used}, f)
+    except Exception:
+        pass
+    if used >= AZURE_FREE_QUOTA * 0.8:
+        _log_tts(f"[Azure] 本月已用约 {used} / {AZURE_FREE_QUOTA} 字符（免费额度的 {used * 100 // AZURE_FREE_QUOTA}%）")
+
+def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
+    """Azure Speech 云端合成，返回 mp3 字节。429/5xx 退避重试，401/403 直接报错。"""
+    import re
+    import urllib.error
+    from xml.sax.saxutils import escape
+    key = _azure_cfg["key"] or os.environ.get("AZURE_SPEECH_KEY", "")
+    region = _azure_cfg["region"] or os.environ.get("AZURE_SPEECH_REGION", "").strip().lower()
+    if not key or not region:
+        raise RuntimeError("未配置 Azure Speech：请在设置里填写 Key 和区域（如 eastus）")
+    if not re.fullmatch(r"[a-z0-9-]+", region):   # region 会拼进主机名，Key 会发往该主机，必须严格校验
+        raise RuntimeError(f"Azure 区域格式不正确：{region!r}")
+    lang = "-".join(voice_name.split("-")[:2])
+    ssml = (f"<speak version='1.0' xml:lang='{lang}' xmlns='http://www.w3.org/2001/10/synthesis'>"
+            f"<voice name='{voice_name}'><prosody rate='{rate}'>{escape(text)}</prosody></voice></speak>")
+    url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/ssml+xml",
+               "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3", "User-Agent": "PyReader"}
     last_err = None
     for attempt in range(3):
         try:
-            return _synth_once(edge_tts, text, voice, rate)
+            req = urllib.request.Request(url, data=ssml.encode("utf-8"), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            if not data:
+                raise RuntimeError("Azure 未返回音频")
+            _azure_usage_add(text)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise RuntimeError(f"Azure Speech 认证失败（HTTP {e.code}），请检查 Key 和区域") from e
+            last_err = e
         except Exception as e:
             last_err = e
-            _log_tts(f"[重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{e}")
-            time.sleep(0.6 * (attempt + 1))   # 0.6s / 1.2s 退避后重试
-    raise RuntimeError(f"语音合成失败（已重试3次）：{last_err}")
+        _log_tts(f"[Azure重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{last_err}")
+        time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"Azure 语音合成失败（已重试3次）：{last_err}")
+
+def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
+    """把一段文本合成音频字节。voice 以 "sherpa:" 走本地 Melo 离线合成（wav，中英混读），
+    以 "piper:" 开头走本地 Piper 离线合成（wav，仅英文），以 "azure:" 走 Azure Speech 云端合成（mp3）。"""
+    if voice.startswith("azure:"):
+        return synthesize_tts_azure(text, voice[len("azure:"):], rate)
+    if voice.startswith("sherpa:") or voice == "piper:zh_CN-huayan-medium":   # 旧配置里的 Piper 中文音色迁移到 Melo
+        return synthesize_tts_sherpa(text, rate)
+    if voice.startswith("piper:"):
+        return synthesize_tts_piper(text, voice[len("piper:"):], rate)
+
+    raise RuntimeError(f"未知的朗读音色：{voice}")
 
 def _log_tts(msg):
     """把朗读相关事件写入 ~/.pyreader/tts.log。"""
@@ -194,18 +357,6 @@ def _log_tts(msg):
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
-
-def _synth_once(edge_tts, text, voice, rate):
-    async def go():
-        com = edge_tts.Communicate(text, voice, rate=rate)
-        out = []
-        async for chunk in com.stream():
-            if chunk["type"] == "audio":
-                out.append(chunk["data"])
-        if not out:
-            raise RuntimeError("edge-tts 未返回音频")
-        return b"".join(out)
-    return asyncio.run(go())
 
 class TtsWorker(QObject):
     ready = Signal(int, bytes)     # (句子序号, mp3 字节)

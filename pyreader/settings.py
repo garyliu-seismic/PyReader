@@ -53,12 +53,15 @@ class SettingsDialog(QDialog):
         self.outer.setValue(cfg.get("outer", 16))
         self.gutter = QSpinBox(); self.gutter.setRange(0, 160)
         self.gutter.setValue(cfg.get("gutter", 32))
-        # 语音朗读（edge-tts）
+        # 语音朗读
         self.tts_voice = QComboBox()
         for label, vid in TTS_VOICES:
             self.tts_voice.addItem(label, vid)
         vi = self.tts_voice.findData(cfg.get("tts_voice", TTS_DEFAULT_VOICE))
         self.tts_voice.setCurrentIndex(vi if vi >= 0 else 0)
+        self.azure_key = QLineEdit(cfg.get("azure_tts_key", "")); self.azure_key.setEchoMode(QLineEdit.Password)
+        self.azure_region = QLineEdit(cfg.get("azure_tts_region", ""))
+        self.azure_region.setPlaceholderText("如 eastus；仅选用 Azure 音色时需要")
         self.tts_rate = QComboBox()
         self.tts_rate.addItems(TTS_RATES)
         ri = self.tts_rate.findText(cfg.get("tts_rate", "+0%"))
@@ -96,8 +99,10 @@ class SettingsDialog(QDialog):
         form.addRow("上下边距", self.margin_y)
         form.addRow("页边距(外)", self.outer)
         form.addRow("书脊", self.gutter)
-        form.addRow("语音朗读", QLabel("（edge-tts，需联网）"))
+        form.addRow("语音朗读", QLabel("（Melo/Piper 离线；Azure 需联网）"))
         form.addRow("朗读音色", self.tts_voice)
+        form.addRow("Azure Speech Key", self.azure_key)
+        form.addRow("Azure 区域", self.azure_region)
         form.addRow("朗读语速", self.tts_rate)
         form.addRow("双语朗读", QLabel("（朗读时 AI 翻译，需 API Key）"))
         form.addRow("双语翻译", self.bilingual)

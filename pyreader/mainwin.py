@@ -27,7 +27,7 @@ from .ai import (translate, lookup, AiWorker,
                   continue_story, analyze_sentiment, explain_background,
                   extract_knowledge_graph)
 from .graph import build_graph_html
-from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_DEFAULT_VOICE, _log_tts
+from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_VOICES, TTS_DEFAULT_VOICE, _log_tts, set_azure_config, sherpa_model_ready
 
 # ============ 主窗口 ============
 class MainWindow(QMainWindow):
@@ -37,6 +37,9 @@ class MainWindow(QMainWindow):
         _saved = load_json(CONFIG_PATH, {})
         _env   = load_env_defaults() if not _saved.get("api_key") else {}
         self.cfg = {**DEFAULT_CONFIG, **_env, **_saved}
+        set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"])
+        if self.cfg.get("tts_voice") not in {v for _, v in TTS_VOICES}:   # 已下线的 edge-tts 音色 → 默认音色
+            self.cfg["tts_voice"] = TTS_DEFAULT_VOICE
         self.bookmarks = load_json(BOOKMARKS_PATH, {})
         self.book_path = book_path
         self.full_text = ""
@@ -114,7 +117,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.bilingual_dock)
         self.bilingual_dock.hide()                       # 默认隐藏
 
-        # ---- 语音朗读（edge-tts）----
+        # ---- 语音朗读 ----
         self.player = QMediaPlayer(self) if _HAS_MULTIMEDIA else None
         if self.player:
             self.audio_out = QAudioOutput(self)
@@ -490,12 +493,15 @@ class MainWindow(QMainWindow):
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
+                "azure_tts_key": dlg.azure_key.text().strip(),
+                "azure_tts_region": dlg.azure_region.text().strip(),
                 "theme": dlg.theme.currentText(),
                 "flip_effect": dlg.flip_effect.currentText(),
                 "bilingual": dlg.bilingual.isChecked(),
                 "bilingual_target": dlg.bilingual_target.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
+            set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"])
             self._apply_theme(self.cfg["theme"])
             self.view._flip_effect = self.cfg["flip_effect"]
             self.bilingual_on = bool(self.cfg["bilingual"])
@@ -780,7 +786,7 @@ class MainWindow(QMainWindow):
         else:
             self.bilingual_out.setPlainText(f"原文：{clean}\n\n译文：{tr}")
 
-    # ---- 语音朗读（edge-tts）----
+    # ---- 语音朗读 ----
     def toggle_reading(self):
         if not _HAS_MULTIMEDIA:
             self.statusBar().showMessage("未安装 QtMultimedia，无法朗读")
@@ -824,7 +830,7 @@ class MainWindow(QMainWindow):
         start_off = max(start_off, ch.start)
         sents = split_sentences(self.full_text[ch.start:ch.end], base=ch.start)
         sents = [(s, e, t) for s, e, t in sents if e > start_off]
-        # 过滤纯标点/无语义内容的句子（edge-tts 无法合成，会报 No audio）
+        # 过滤纯标点/无语义内容的句子（TTS 无法合成，会报 No audio）
         sents = [(s, e, t) for s, e, t in sents if re.search(r"[0-9A-Za-z\u4e00-\u9fff]", t)]
         sents = [(s, e, t) for s, e, t in sents if re.sub(r"\s+", " ", t).strip()]
         self.tts_chapter = ci
@@ -849,8 +855,12 @@ class MainWindow(QMainWindow):
         s, e, _ = self.tts_sentences[seq]
         self.view.read_start, self.view.read_end = s, e
         self._reveal_offset(s)
-        self.statusBar().showMessage(
-            f"🔊 朗读中 · 第{self.tts_chapter + 1}章 · {seq + 1}/{len(self.tts_sentences)}句")
+        if seq == 0 and not sherpa_model_ready() and \
+           self.cfg.get("tts_voice", TTS_DEFAULT_VOICE).startswith("sherpa:"):
+            self.statusBar().showMessage("⏬ 首次使用，正在下载离线语音模型（约 190MB，需 1~3 分钟），完成后自动开始朗读…")
+        else:
+            self.statusBar().showMessage(
+                f"🔊 朗读中 · 第{self.tts_chapter + 1}章 · {seq + 1}/{len(self.tts_sentences)}句")
         if self.bilingual_on:
             self._update_bilingual(seq)
             self._tr_kick(seq)
