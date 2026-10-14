@@ -2,15 +2,13 @@ import os
 import re
 import threading
 from typing import Optional
-from PySide6.QtCore import Qt, QTimer, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon
+from PySide6.QtCore import Qt, QTimer, QBuffer, QByteArray, QIODevice, QUrl
+from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetItem,
                                QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel,
                                QFileDialog, QMessageBox, QProgressBar, QSlider, QDockWidget,
                                QLineEdit, QToolButton, QWidgetAction, QHBoxLayout, QFrame,
                                QTabWidget, QPushButton, QSizePolicy, QSplitter)
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtCore import QUrl
 from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
                      load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA, QMediaPlayer, QAudioOutput,
@@ -85,12 +83,12 @@ class MainWindow(QMainWindow):
         t1v.addWidget(self.ai_out)
         t1v.addWidget(qa_row)
 
-        # Tab 2：知识图谱（WebEngine）
-        self.graph_view = QWebEngineView()
-        self.graph_view.setHtml(
-            "<body style='background:#1e1e2e;color:#666;font-family:sans-serif;"
-            "display:flex;align-items:center;justify-content:center;height:100vh;'>"
-            "<p>点击工具栏 🤖AI功能 → 知识图谱 生成图谱</p></body>")
+        # Tab 2：知识图谱（生成后在系统默认浏览器中打开，避免捆绑 QtWebEngine）
+        self.graph_view = QLabel(
+            "点击工具栏 🤖AI功能 → 知识图谱 生成图谱\n\n"
+            "（图谱将用系统默认浏览器打开）")
+        self.graph_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.graph_view.setStyleSheet("color:#888; font-size:13px;")
         tab2 = QWidget(); t2v = QVBoxLayout(tab2); t2v.setContentsMargins(0, 0, 0, 0)
         t2v.addWidget(self.graph_view)
 
@@ -649,10 +647,7 @@ class MainWindow(QMainWindow):
             return
         self.ai_dock.show()
         self.ai_tabs.setCurrentIndex(1)          # 切换到图谱 Tab
-        self.graph_view.setHtml(
-            "<body style='background:#1e1e2e;color:#aaa;font-family:sans-serif;"
-            "display:flex;align-items:center;justify-content:center;height:100vh;'>"
-            "<p>⚙️ AI 正在提取知识图谱…</p></body>")
+        self.graph_view.setText("⚙️ AI 正在提取知识图谱…\n\n完成后将在系统默认浏览器中打开")
         self.statusBar().showMessage(f"🕸️ AI 正在构建《{title}》的知识图谱…")
 
         def _build():
@@ -664,12 +659,12 @@ class MainWindow(QMainWindow):
             _tmp = _os.path.join(tempfile.gettempdir(), "pyreader_graph.html")
             with open(_tmp, "w", encoding="utf-8") as _f:
                 _f.write(html)
-            self.graph_view.load(QUrl.fromLocalFile(_tmp))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(_tmp))
+            self.graph_view.setText(f"✅ 知识图谱已生成：《{title}》\n\n已用系统默认浏览器打开。")
             self.statusBar().showMessage(f"🕸️ 知识图谱已生成：《{title}》")
 
         def _on_fail(msg: str):
-            from .graph import _error_html
-            self.graph_view.setHtml(_error_html(msg))
+            self.graph_view.setText(f"❌ 知识图谱生成失败：\n{msg[:200]}")
             self.statusBar().showMessage(f"❌ 知识图谱失败：{msg[:60]}")
 
         self.worker = AiWorker(_build)

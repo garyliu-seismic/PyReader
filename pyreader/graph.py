@@ -6,7 +6,7 @@
   若未安装则降级为轻量 SVG 静态渲染（用 networkx + 基础布局）。
 - 节点按 type 区分颜色：person=蓝, place=绿, event=橙, item=紫, concept=灰。
 - 支持拖拽、缩放、鼠标悬停显示 desc。
-- 返回完整 HTML 字符串，交给 QWebEngineView.setHtml() 显示。
+- 返回完整 HTML 字符串，由主窗口写入临时文件后用系统默认浏览器打开显示。
 """
 
 import json
