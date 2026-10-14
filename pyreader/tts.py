@@ -124,6 +124,28 @@ def _rate_to_speed(rate: str) -> float:
         pct = 0
     return max(0.5, min(3.0, 1.0 + pct / 100.0))
 
+def _normalize_loudness(samples, target_rms=0.15, max_gain=6.0, peak_ceiling=0.95):
+    """句级响度归一化：把每句音频的 RMS 对齐到同一水平，消除句与句之间的忽高忽低。
+
+    Melo/Piper 逐句合成时，每句响度差异很大（实测可达 20~30 dB，短句尤其轻），
+    直接播放就会听起来一声大一声小。这里把每句都缩放到同一 RMS 水平。
+      target_rms   ：目标 RMS（float 幅度，0.15 ≈ -16.5 dBFS，正常语音响度）
+      max_gain     ：放大上限，避免近乎静音的句子被放大成噪音
+      peak_ceiling ：峰值上限，放大后峰值不超过该值，避免削波失真
+    """
+    import numpy as np
+    s = np.asarray(samples, dtype=np.float32)
+    rms = float(np.sqrt(np.mean(s.astype(np.float64) ** 2)))
+    if rms < 1e-4:
+        return s                      # 近乎静音，不动
+    gain = target_rms / rms
+    peak = float(np.max(np.abs(s))) if s.size else 0.0
+    if peak > 0 and gain * peak > peak_ceiling:
+        gain = peak_ceiling / peak    # 峰值保护：优先于 RMS，避免削波
+    if gain > max_gain:
+        gain = max_gain               # 静音段不要被无限放大
+    return s * gain
+
 def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
     """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。"""
     import numpy as np
@@ -132,7 +154,8 @@ def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
         g = tts.generate(text, sid=0, speed=_rate_to_speed(rate))
     if not len(g.samples):
         raise RuntimeError("Melo 未返回音频")
-    pcm = (np.clip(np.asarray(g.samples, dtype=np.float32), -1, 1) * 32767).astype(np.int16)
+    samples = _normalize_loudness(g.samples)
+    pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(g.sample_rate)
@@ -201,6 +224,22 @@ def _load_piper_voice(voice_id: str):
         _piper_voice_cache[voice_id] = voice
         return voice
 
+def _normalize_wav_bytes(data: bytes) -> bytes:
+    """对 wav 字节里的 PCM 做响度归一化后重写，用于 Piper 等直接输出 wav 的引擎。"""
+    import numpy as np
+    r = io.BytesIO(data)
+    with wave.open(r, "rb") as w:
+        sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    samples = pcm.astype(np.float32) / 32767.0
+    samples = _normalize_loudness(samples)
+    out = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(ch); w.setsampwidth(sw); w.setframerate(sr)
+        w.writeframes(out.tobytes())
+    return buf.getvalue()
+
 def synthesize_tts_piper(text: str, voice_id: str, rate: str) -> bytes:
     """离线合成（Piper），返回 wav 字节。"""
     from piper import SynthesisConfig
@@ -209,7 +248,7 @@ def synthesize_tts_piper(text: str, voice_id: str, rate: str) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
         voice.synthesize_wav(text, wav_file, syn_config=syn_config)
-    return buf.getvalue()
+    return _normalize_wav_bytes(buf.getvalue())
 
 def split_sentences(text: str, base: int = 0):
     """把文本切成句子：返回 [(起始偏移, 结束偏移, 句子文本)]，偏移为全局字符偏移。
@@ -376,11 +415,31 @@ def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
             errors.append(f"账号{i}：{e}")
     raise RuntimeError("Azure Speech 所有账号均不可用，请检查 Key、区域和额度（" + "；".join(errors) + "）")
 
+# 离线引擎（Melo/Piper）词表里没有的标点/符号 → 换成有停顿的等价标点或删除。
+# 否则这些字符会被当成 OOV 静默丢弃（如 '…'），导致该有的停顿消失、语句粘连。
+# 注意键的顺序：先匹配更长的（“……”→“，”在“…”→“，”之前，“——”在“—”之前）。
+_TTS_PUNCT_REPLACE = {
+    "……": "，", "…": "，", "‥": "，", "⋯": "，",
+    "——": "，", "―": "，", "—": "，",
+    "～": "，", "~": "，",
+    "“": "", "”": "", "‘": "", "’": "",
+    "·": " ",            # 外国人名中点 → 空格（如 阿加莎·克里斯蒂）
+    "《": "", "》": "", "〈": "", "〉": "",
+    "（": " ", "）": " ", "【": " ", "】": " ", "〔": " ", "〕": " ",
+}
+
+def _normalize_tts_text(text: str) -> str:
+    """把离线 TTS 不认识的标点替换成等价标点/删除，避免被静默丢弃导致停顿消失。"""
+    for k, v in _TTS_PUNCT_REPLACE.items():
+        text = text.replace(k, v)
+    return text
+
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
     """把一段文本合成音频字节。voice 以 "sherpa:" 走本地 Melo 离线合成（wav，中英混读），
     以 "piper:" 开头走本地 Piper 离线合成（wav，仅英文），以 "azure:" 走 Azure Speech 云端合成（mp3）。"""
     if voice.startswith("azure:"):
         return synthesize_tts_azure(text, voice[len("azure:"):], rate)
+    text = _normalize_tts_text(text)   # 离线引擎：先归一化标点，避免 OOV 字符被静默丢弃
     if voice.startswith("sherpa:") or voice == "piper:zh_CN-huayan-medium":   # 旧配置里的 Piper 中文音色迁移到 Melo
         return synthesize_tts_sherpa(text, rate)
     if voice.startswith("piper:"):
