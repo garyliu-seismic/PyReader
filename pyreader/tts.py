@@ -205,47 +205,75 @@ def reset_loudness_state():
     with _prev_gain_lock:
         _prev_gain[0] = None
 
-# Melo 对极短输入（尤其是单字句如“不。”）有概率性缺陷：偶尔会合成出幅度极度低的伪音频
-# （实测 RMS 可低至正常语音的 1/2000，但并非真正的 0），听感上就是这个字完全不发音。
-# 实测：这是 VITS 解码器对特定短文本的确定性缺陷（失败样本长度常固定在同一值），单纯重复
-# 相同调用效果有限（单字句实测失败率可达 ~67%，6 次重试仍有 ~8% 概率全部失败）。
-# 改为每次重试时对 speed 做小幅随机扰动（±15%，人耳难以察觉），实测能显著改变推理路径、
-# 避开这种确定性失败，失败率降到 ~4~10%。
-# 失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值设在 1e-4 足够可靠地区分。
+# Melo 有两种独立的概率性解码缺陷，都会让某段音频幅度异常低，听感上就是那几个字不发音：
+#   1. 整句失败：整句 RMS 都极低（尤其是单字句如“不。”，实测失败率可达 ~67%）。
+#   2. 句首吸字：整句平均 RMS 正常，但句首前 ~0.25s 异常安静（实测如长句开头是
+#      “谢谢，部长先生，那么……”这种，句首——对应“谢谢”两字——被模型吸掉，实测发现有些文本
+#      在按 speed 重试时甚至 100% 固定失败，说明这不是随机种子问题，而是文本本身触发的确定性 bug。
+# 对策略分两步：
+#   第 1~3 次重试：只扰动 speed（±15%，人耳难以察觉），对部分「真随机」失败有效且不改变听感。
+#   第 4 次起：若仍失败（说明是文本触发的固定性 bug，speed 扰动无效），改在文本前加一个有实际
+#      发音内容的语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
+#      改变音素上下文来规避这个确定性缺陷。代价是听到一个多余的语气词开头，但远比关键内容完全丢失好。
+#      注意：纯标点（逗号/句号）完全无效，必须是实词，因为标点本身不产生音素。
+# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值设在 1e-4 足够可靠地区分。
+# 句首吸字样本句首段 rms 在 0.002~0.01，正常句首在 0.02 以上，阈值设在 0.015 区分。
 SHERPA_SILENT_RMS_THRESHOLD = 0.0001
+SHERPA_HEAD_WINDOW_SEC = 0.25         # 检测句首吸字的窗口长度（秒）
+SHERPA_HEAD_RMS_THRESHOLD = 0.015     # 句首窗口 RMS 低于此值视为可能吸字
 SHERPA_SILENT_RETRY = 8               # 最多重试次数
 SHERPA_SILENT_SPEED_JITTER = 0.15     # 每次重试对 speed 的最大随机扰动幅度（按比例）
+SHERPA_SPEED_ONLY_RETRY = 3           # 前几次重试只扰动 speed，超过这个次数还失败才改加前缀文本
+SHERPA_FALLBACK_PREFIX = "这个，"      # 触发文本本身的确定性失败时，用这个语气词前缀规避
+
+def _sherpa_detect_bad(g, text):
+    """检测一次 Melo 生成结果是否命中上述两种已知缺陷之一。返回 (is_bad, 诊断信息)。"""
+    import numpy as np
+    samples = np.asarray(g.samples, dtype=np.float64)
+    if not samples.size:
+        return True, "empty"
+    overall_rms = float(np.sqrt(np.mean(samples ** 2)))
+    if overall_rms < SHERPA_SILENT_RMS_THRESHOLD and len(text) > 1:
+        return True, f"整句伪静音 rms={overall_rms:.6f}"
+    head_n = int(g.sample_rate * SHERPA_HEAD_WINDOW_SEC)
+    if len(samples) > head_n * 2:   # 句子至少要比检测窗口长很多，避免短句被误判
+        head_rms = float(np.sqrt(np.mean(samples[:head_n] ** 2)))
+        if head_rms < SHERPA_HEAD_RMS_THRESHOLD and overall_rms >= SHERPA_SILENT_RMS_THRESHOLD:
+            return True, f"句首吸字 head_rms={head_rms:.5f}（整句rms={overall_rms:.5f}）"
+    return False, ""
 
 def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
     """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。
-    对极短输入偶发的伪静音问题做重试保护（详见 SHERPA_SILENT_RMS_THRESHOLD 注释），
-    重试全部用尽仍失败则返回短暂静音（总比播放伪噪声的下限更好）。"""
+    对整句伪静音/句首吸字两种已知缺陷做重试保护（详见前面长注释）：
+    先扰动 speed 重试，仍失败则换成加前缀文本重试，全部用尽仍失败则返回短暂静音。"""
     import numpy as np
     import random
     base_speed = _rate_to_speed(rate)
     speed = base_speed
     g = None
-    raw_rms = 0.0
+    is_bad, reason = True, ""
+    used_prefix = False
     for attempt in range(SHERPA_SILENT_RETRY):
+        cur_text = text
+        if attempt >= SHERPA_SPEED_ONLY_RETRY:
+            cur_text = SHERPA_FALLBACK_PREFIX + text   # speed 扰动无效时，改加前缀改变音素上下文
+            used_prefix = True
         with _sherpa_lock:
             tts = _load_sherpa_tts()
-            g = tts.generate(text, sid=0, speed=speed)
+            g = tts.generate(cur_text, sid=0, speed=speed)
         if not len(g.samples):
             raise RuntimeError("Melo 未返回音频")
-        raw_rms = float(np.sqrt(np.mean(np.asarray(g.samples, dtype=np.float64) ** 2)))
-        if raw_rms >= SHERPA_SILENT_RMS_THRESHOLD or len(text) <= 1:
-            break   # 响度正常，或文本本身就是极短（如单个标点）不必重试
-        _log_tts(f"[Melo重试] 疑似合成失败（rms={raw_rms:.6f}，第{attempt + 1}次）：{text[:30]!r}")
+        is_bad, reason = _sherpa_detect_bad(g, cur_text)
+        if not is_bad:
+            break
+        _log_tts(f"[Melo重试] {reason}（第{attempt + 1}次{'，已加前缀' if used_prefix else ''}）：{text[:30]!r}")
         speed = base_speed * (1.0 + random.uniform(-SHERPA_SILENT_SPEED_JITTER, SHERPA_SILENT_SPEED_JITTER))
-    else:
-        if raw_rms < SHERPA_SILENT_RMS_THRESHOLD:
-            _log_tts(f"[Melo重试失败] 重试{SHERPA_SILENT_RETRY}次仍合成伪静音，改返回短暂静音：{text[:30]!r}")
-            g = None
-    if g is None:
+    if is_bad:
+        _log_tts(f"[Melo重试失败] 重试{SHERPA_SILENT_RETRY}次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
-            w.writeframes(b"\x00\x00" * int(44100 * 0.15))   # 150ms 短暂静音，代替伪噪声
+            w.writeframes(b"\x00\x00" * int(44100 * 0.15))   # 150ms 短暂静音，代替伪噪声/吸字
         return buf.getvalue()
     samples = _normalize_loudness(g.samples, sample_rate=g.sample_rate)
     pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
