@@ -28,11 +28,11 @@ FLIP_MS = 380            # 3D 翻页动画时长（毫秒）
 FLIP_PERSPECTIVE = 5.0   # 翻页透视强度（相机距离 = 页宽 × 该系数，越小越夸张/文字越压缩）
 
 # ---- 多媒体（语音朗读用）----
+# 实际播放用 QAudioSink 持续流（见 .ttsplayer.TtsPlayer），这里只是检测 QtMultimedia 模块是否可用。
 try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimedia import QAudioSink  # noqa: F401  仅用于模块可用性探测
     _HAS_MULTIMEDIA = True
 except Exception:
-    QMediaPlayer = QAudioOutput = None
     _HAS_MULTIMEDIA = False
 
 

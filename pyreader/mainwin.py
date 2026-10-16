@@ -2,7 +2,7 @@ import os
 import re
 import threading
 from typing import Optional
-from PySide6.QtCore import Qt, QTimer, QBuffer, QByteArray, QIODevice, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetItem,
                                QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel,
@@ -11,9 +11,10 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetIte
                                QTabWidget, QPushButton, QSizePolicy, QSplitter)
 from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
                      load_env_defaults,
-                     LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA, QMediaPlayer, QAudioOutput,
+                     LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA,
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
                      FLIP_EFFECTS, DEFAULT_FLIP_EFFECT)
+from .ttsplayer import TtsPlayer
 from .markdown import md_chapters, MD_HEAD_RE
 from .textio import MD_EXTS
 from .pager import LazyPager
@@ -25,7 +26,7 @@ from .ai import (translate, lookup, AiWorker,
                   continue_story, analyze_sentiment, explain_background,
                   extract_knowledge_graph)
 from .graph import build_graph_html
-from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_VOICES, TTS_DEFAULT_VOICE, _log_tts, set_azure_config, sherpa_model_ready
+from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_VOICES, TTS_DEFAULT_VOICE, _log_tts, set_azure_config, sherpa_model_ready, kokoro_model_ready, reset_loudness_state
 
 # ============ 主窗口 ============
 class MainWindow(QMainWindow):
@@ -117,11 +118,11 @@ class MainWindow(QMainWindow):
         self.bilingual_dock.hide()                       # 默认隐藏
 
         # ---- 语音朗读 ----
-        self.player = QMediaPlayer(self) if _HAS_MULTIMEDIA else None
+        # 用 QAudioSink 持续流播放（TtsPlayer）而不是 QMediaPlayer 每句重开媒体源：
+        # 后者每次切换音频源都要重新打开/配置音频设备管线，会产生可闻的哒哒声（"du"音）。
+        self.player = TtsPlayer(self) if _HAS_MULTIMEDIA else None
         if self.player:
-            self.audio_out = QAudioOutput(self)
-            self.player.setAudioOutput(self.audio_out)
-            self.player.mediaStatusChanged.connect(self._on_tts_media_status)
+            self.player.sentenceFinished.connect(self._on_tts_sentence_finished)
         self.tts_on = False
         self.tts_paused = False
         self.tts_chapter = 0
@@ -132,7 +133,6 @@ class MainWindow(QMainWindow):
         self.tts_inflight = set()
         self.tts_workers = {}         # seq -> TtsWorker（防止信号前被 GC）
         self.tts_failed_seqs = set()  # 本章内合成失败的句子（跳过，不重试）
-        self.tts_buf = None
         self.bilingual_on = bool(self.cfg.get("bilingual", False))
         self.tr_cache = {}            # seq -> 译文
         self.tr_inflight = set()
@@ -799,8 +799,8 @@ class MainWindow(QMainWindow):
         if self.tts_on and self.tts_paused:
             self.tts_paused = False
             self._update_tts_actions()
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-                self.player.play()
+            if self.player.is_paused():
+                self.player.resume()
             else:
                 data = self.tts_cache.pop(self.tts_idx, None)
                 if data is not None:
@@ -812,6 +812,7 @@ class MainWindow(QMainWindow):
             return
         self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
         self.tts_on = True; self.tts_paused = False
+        reset_loudness_state()   # 新一次朗读清空跨句增益平滑状态，避免上一次朗读的增益残留影响这次开头几句
         self._update_tts_actions()
         if self._tts_load_chapter(self.cur_chapter, start_off=self.view.left_page_offset()):
             self._tts_start_sentence(0)
@@ -854,8 +855,10 @@ class MainWindow(QMainWindow):
         s, e, _ = self.tts_sentences[seq]
         self.view.read_start, self.view.read_end = s, e
         self._reveal_offset(s)
-        if seq == 0 and not sherpa_model_ready() and \
-           self.cfg.get("tts_voice", TTS_DEFAULT_VOICE).startswith("sherpa:"):
+        voice = self.cfg.get("tts_voice", TTS_DEFAULT_VOICE)
+        if seq == 0 and voice.startswith("kokoro:") and not kokoro_model_ready():
+            self.statusBar().showMessage("⏬ 首次使用，正在下载离线语音模型（约 140MB，需 1~3 分钟），完成后自动开始朗读…")
+        elif seq == 0 and voice.startswith("sherpa:") and not sherpa_model_ready():
             self.statusBar().showMessage("⏬ 首次使用，正在下载离线语音模型（约 190MB，需 1~3 分钟），完成后自动开始朗读…")
         else:
             self.statusBar().showMessage(
@@ -896,8 +899,7 @@ class MainWindow(QMainWindow):
             return
         self.tts_workers.pop((epoch, seq), None)
         self.tts_inflight.discard(seq)
-        if seq == self.tts_idx and not self.tts_paused \
-           and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+        if seq == self.tts_idx and not self.tts_paused and not self.player.is_playing():
             self._tts_play_data(seq, data)     # 当前句：直接播，不入缓存
         else:
             self.tts_cache[seq] = data         # 预取句：先缓存
@@ -908,12 +910,7 @@ class MainWindow(QMainWindow):
         if not data:
             self._tts_advance()
             return
-        buf = QBuffer()
-        buf.setData(QByteArray(data))
-        buf.open(QIODevice.OpenModeFlag.ReadOnly)
-        self.tts_buf = buf
-        self.player.setSourceDevice(buf)
-        self.player.play()
+        self.player.play_wav(data)
 
     def _tts_advance(self):
         nxt = self.tts_idx + 1
@@ -924,10 +921,9 @@ class MainWindow(QMainWindow):
         else:
             self._tts_next_chapter()
 
-    def _on_tts_media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            # 延迟到下一轮事件循环，避免在媒体信号回调里重入 play() 导致卡死
-            QTimer.singleShot(0, self._tts_advance)
+    def _on_tts_sentence_finished(self):
+        # 延迟到下一轮事件循环，避免在播放完成回调里重入引发下一句合成/播放导致卡死
+        QTimer.singleShot(0, self._tts_advance)
 
     def _tts_on_failed(self, epoch, seq, msg):
         """单句合成失败：跳过该句继续朗读，而不是中断整章。"""
@@ -953,7 +949,6 @@ class MainWindow(QMainWindow):
         self.tr_cache = {}; self.tr_inflight = set(); self.tr_workers = {}
         if self.player:
             self.player.stop()
-        self.tts_buf = None
         self.view.read_start = self.view.read_end = -1
         self.view.update()
         self._update_tts_actions()
