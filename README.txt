@@ -235,17 +235,21 @@ PyReader —— 基于 Python 的文本小说阅读器
     中文音色  晓晓（默认）/晓伊/晓墨/云希/云扬/云健/晓北/晓妮/晓臻/云哲
     英文音色  Aria / Jenny / Guy / Sonia / Ryan
     日语音色  Nanami / Keita
-    离线音色  Melo（中英混读，首次自动下载约 190MB）/ Lessac（英），无需联网
+    离线音色  Melo（中英混读，默认，首次自动下载约 190MB）/ Lessac（英）/
+              Kokoro-82M（中英混读·女/男4音色，备选，中文自然度较 Melo 差，首次自动下载约 140MB），均无需联网
     在线音色  Azure Speech（中/英/日/韩/法/德/西），设置里填 Key 和区域（config.json: azure_tts_key / azure_tts_region）
     朗读语速  -50% ~ +100%
 
   依赖：
     pip install sherpa-onnx   # Melo 离线语音合成（中英混读，模型首次自动下载）
     pip install piper-tts     # 离线语音（可选，模型首次自动下载，之后无需联网）
+    pip install edge-tts      # Azure 额度用尽时的免费补充回退（可选，需 >=7.3.0，见下方说明）
     # PySide6 需包含 QtMultimedia（标准 PySide6 安装即含，用于播放）
 
   说明：Azure 音色需要 Azure Speech 资源（F0 免费层每月 50 万字符，中日韩每字按 2 计），
-  本月用量记录在 ~/.pyreader/azure_usage.json。
+  本月用量记录在 ~/.pyreader/azure_usage.json。额度用尽或账号不可用时，Azure 音色会自动
+  回退到 edge-tts（同名 Neural 音色，免费、无额度限制，但为微软非官方接口，偶发因对方
+  调整鉴权而失效——2026-10 曾出现 403，需 edge-tts>=7.3.0 修复），仅作兜底补充，不保证长期稳定。
 
 【主题】
   工具栏 → 设置 → 主题：夜间（默认）/ 纯白 / 米黄（护眼）/ 浅绿（护眼），
