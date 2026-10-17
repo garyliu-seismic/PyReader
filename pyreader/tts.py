@@ -592,7 +592,7 @@ def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> 
             f"<voice name='{voice_name}'><prosody rate='{rate}'>{escape(text)}</prosody></voice></speak>")
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/ssml+xml",
-               "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3", "User-Agent": "PyReader"}
+               "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm", "User-Agent": "PyReader"}
     last_err = None
     for attempt in range(3):
         try:
