@@ -24,15 +24,18 @@ WHEEL_THRESHOLD = 80.0  # 滚轮/滑动翻页触发阈值（角度单位）
 INDENT_SPACES = 2       # 段落首行缩进（中文字符数）
 PARA_SPACING = 0.5      # 段落间距（行高的倍数）
 CLICK_ZONE = 0.28       # 单击左右两侧翻页的触发宽度（占窗口比例）
-FLIP_MS = 380            # 3D 翻页动画时长（毫秒）
+FLIP_MS = 800            # 3D 翻页动画时长（毫秒）
+FLIP_STRIPS = 20          # 卷曲页竖带数（越大越平滑，越慢）
+FLIP_CURL = 0.9           # 卷曲强度：自由端相对书脊端滞后的最大角度(弧度)，0=刚性平板
+FLIP_TILT = 0.14          # 斜翻强度：上下角自由边位置差（0=不斜）
 FLIP_PERSPECTIVE = 5.0   # 翻页透视强度（相机距离 = 页宽 × 该系数，越小越夸张/文字越压缩）
 
 # ---- 多媒体（语音朗读用）----
+# 实际播放用 QAudioSink 持续流（见 .ttsplayer.TtsPlayer），这里只是检测 QtMultimedia 模块是否可用。
 try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimedia import QAudioSink  # noqa: F401  仅用于模块可用性探测
     _HAS_MULTIMEDIA = True
 except Exception:
-    QMediaPlayer = QAudioOutput = None
     _HAS_MULTIMEDIA = False
 
 

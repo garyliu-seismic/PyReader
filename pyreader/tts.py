@@ -2,16 +2,25 @@ import os
 import io
 import wave
 import time
+import asyncio
 import threading
+import bz2
+import tarfile
 import urllib.request
 from PySide6.QtCore import QObject, Signal
 from .config import APP_DIR
 from .ai import translate_to
 
-# ============ 语音朗读（Melo 离线 / Azure Speech / Piper 离线英文） ============
+# ============ 语音朗读（Melo/Kokoro 离线 / Azure Speech / Piper 离线英文） ============
 TTS_VOICES = [
     ("Melo（中英混读·女·离线，默认）", "sherpa:melo-zh_en"),
     ("Lessac（英文·离线，无需联网）", "piper:en_US-lessac-medium"),
+    # Kokoro-82M（sherpa-onnx 走 espeak-ng 做中文音素化，实测中文自然度/耐听度明显低于 Melo，
+    # 仅作备选不作默认，容易听出机器感）
+    ("Kokoro-晓晓（中英混读·女·离线，响度更稳但机械感明显）", "kokoro:zf_xiaoxiao"),
+    ("Kokoro-晓伊（中英混读·女·离线）", "kokoro:zf_xiaoyi"),
+    ("Kokoro-云希（中英混读·男·离线）", "kokoro:zm_yunxi"),
+    ("Kokoro-云健（中英混读·男·离线）", "kokoro:zm_yunjian"),
     # Azure Speech（官方接口，需在设置里填 Key 和区域；F0 免费层每月 50 万字符，中日韩每字按 2 计）
     ("Nanami（日文·女·Azure）", "azure:ja-JP-NanamiNeural"),
     ("Keita（日文·男·Azure）", "azure:ja-JP-KeitaNeural"),
@@ -116,45 +125,258 @@ def _load_sherpa_tts():
     _sherpa_tts = sherpa_onnx.OfflineTts(cfg)
     return _sherpa_tts
 
+# Melo 模型原生语速（speed=1.0）偏快——VITS 类模型训练语料本身偏快是通病，
+# 商用 TTS 通常会把默认语速调慢一点。这里给 "+0%" 档位乘上一个 <1 的基准系数，
+# 让默认听感更接近正常朗读节奏，用户手动调的档位仍是在这个基准上等比例缩放。
+MELO_BASE_SPEED = 0.85
+
 def _rate_to_speed(rate: str) -> float:
-    """把 "+10%"/"-25%" 语速转成 Sherpa 的 speed（越大越快）。"""
+    """把 "+10%"/"-25%" 语速档位转成 Sherpa 的 speed（越大越快），在 Melo 偏慢的基准上再缩放。"""
     try:
         pct = int(str(rate).strip().replace("%", ""))
     except Exception:
         pct = 0
-    return max(0.5, min(3.0, 1.0 + pct / 100.0))
+    return max(0.4, min(3.0, MELO_BASE_SPEED * (1.0 + pct / 100.0)))
 
-def _normalize_loudness(samples, target_rms=0.15, max_gain=6.0, peak_ceiling=0.95):
-    """句级响度归一化：把每句音频的 RMS 对齐到同一水平，消除句与句之间的忽高忽低。
+# 跨句增益平滑：记录上一句的增益，用于限制相邻句子间的增益跳变幅度。
+# 按句序列播放时近似有效（TtsWorker 按 seq 顺序合成），多线程并发合成时仅影响平滑精度，不影响正确性。
+_prev_gain_lock = threading.Lock()
+_prev_gain = [None]
 
-    Melo/Piper 逐句合成时，每句响度差异很大（实测可达 20~30 dB，短句尤其轻），
-    直接播放就会听起来一声大一声小。这里把每句都缩放到同一 RMS 水平。
+def _normalize_loudness(samples, target_rms=0.15, max_gain=8.0, peak_ceiling=0.95, max_step_db=3.0, sample_rate=44100):
+    """句级响度归一化 + 跨句最终响度平滑，消除句与句之间的忽高忽低。
+
+    Melo/Piper 逐句合成时，每句响度差异很大（实测可达 20~30 dB，短句尤其轻）。
+    注意：这里限制的是最终输出 RMS 的跨句跳变幅度，而不是增益本身的跳变幅度——
+    因为原始句子间响度差异很大，即使增益本身跳变被限制住，最终听到的音量（=原始RMS×增益）
+    仍可能跳变很大；另外 max_gain 封顶会在过强放大时把响度拉不到目标，让该句比前后都轻。
+    改为直接限制最终 RMS 相对上一句最终 RMS 的跳变幅度，语义上更直接对应听感。
       target_rms   ：目标 RMS（float 幅度，0.15 ≈ -16.5 dBFS，正常语音响度）
       max_gain     ：放大上限，避免近乎静音的句子被放大成噪音
       peak_ceiling ：峰值上限，放大后峰值不超过该值，避免削波失真
+      max_step_db  ：相邻两句最终 RMS 每次最大变化幅度（dB），越小过渡越平滑但越慢追上目标响度
     """
     import numpy as np
     s = np.asarray(samples, dtype=np.float32)
     rms = float(np.sqrt(np.mean(s.astype(np.float64) ** 2)))
     if rms < 1e-4:
-        return s                      # 近乎静音，不动
-    gain = target_rms / rms
+        return s                      # 近乎静音，不动（不更新 _prev_gain，避免静音段拉坏后续平滑基准）
     peak = float(np.max(np.abs(s))) if s.size else 0.0
+
+    gain = target_rms / rms
     if peak > 0 and gain * peak > peak_ceiling:
         gain = peak_ceiling / peak    # 峰值保护：优先于 RMS，避免削波
-    if gain > max_gain:
-        gain = max_gain               # 静音段不要被无限放大
-    return s * gain
+    gain = min(gain, max_gain)        # 静音段不要被无限放大
+    target = rms * gain               # 这句自身能达到的最终响度（受 peak_ceiling/max_gain 限制后的实际值）
+
+    with _prev_gain_lock:
+        prev_rms = _prev_gain[0]
+        if prev_rms is not None and prev_rms > 1e-6:
+            step_limit = 10 ** (max_step_db / 20.0)          # dB -> 线性倍数
+            ratio = target / prev_rms
+            if ratio > step_limit:
+                target = prev_rms * step_limit               # 最终响度涨得太快→截住
+            elif ratio < 1.0 / step_limit:
+                target = prev_rms / step_limit               # 最终响度跌得太快→截住
+        _prev_gain[0] = target
+    gain = target / rms
+    if peak > 0 and gain * peak > peak_ceiling:                 # 平滑后的增益也不能切波
+        gain = peak_ceiling / peak
+        with _prev_gain_lock:
+            _prev_gain[0] = rms * gain                           # 削波保护生效时，同步更新平滑基准，避免下一句按未生效的目标值续跟
+    return _apply_edge_fade(s * gain, sample_rate=sample_rate)
+
+def _apply_edge_fade(samples, fade_ms=15, sample_rate=44100):
+    """对音频首尾做短淡入淡出，消除每句切换播放源（QMediaPlayer 每句重新 setSourceDevice）
+    带来的启动/停止爆音（“嗟”声）。fade_ms 按 44.1kHz 设计，实际调用时会按真实采样率换算。
+    15ms 足够消除冲击声，又短到不会影响语音可听度。"""
+    import numpy as np
+    n = int(sample_rate * fade_ms / 1000)
+    if n <= 0 or samples.size < 2 * n:
+        return samples
+    s = samples.copy()
+    ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    s[:n] *= ramp
+    s[-n:] *= ramp[::-1]
+    return s
+
+def reset_loudness_state():
+    """新一次朗读开始前清空跨句增益平滑的状态，避免上一次朗读/上一本书的增益残留影响这次开头几句。"""
+    with _prev_gain_lock:
+        _prev_gain[0] = None
+
+# Melo 有两种独立的概率性解码缺陷，都会让某段音频幅度异常低，听感上就是那几个字不发音：
+#   1. 整句失败：整句 RMS 都极低（尤其是单字句如“不。”，实测失败率可达 ~67%）。
+#   2. 句首吸字：整句平均 RMS 正常，但句首前 ~0.25s 异常安静（实测如长句开头是
+#      “谢谢，部长先生，那么……”这种，句首——对应“谢谢”两字——被模型吸掉，实测发现有些文本
+#      在按 speed 重试时甚至 100% 固定失败，说明这不是随机种子问题，而是文本本身触发的确定性 bug。
+# 对策略分两步：
+#   第 1~3 次重试：只扰动 speed（±15%，人耳难以察觉），对部分「真随机」失败有效且不改变听感。
+#   第 4 次起：若仍失败（说明是文本触发的固定性 bug，speed 扰动无效），改在文本前加一个有实际
+#      发音内容的语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
+#      改变音素上下文来规避这个确定性缺陷。代价是听到一个多余的语气词开头，但远比关键内容完全丢失好。
+#      注意：纯标点（逗号/句号）完全无效，必须是实词，因为标点本身不产生音素。
+# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值设在 1e-4 足够可靠地区分。
+# 句首吸字样本句首段 rms 在 0.002~0.01，正常句首在 0.02 以上，阈值设在 0.015 区分。
+SHERPA_SILENT_RMS_THRESHOLD = 0.0001
+SHERPA_HEAD_WINDOW_SEC = 0.25         # 检测句首吸字的窗口长度（秒）
+SHERPA_HEAD_RMS_THRESHOLD = 0.015     # 句首窗口 RMS 低于此值视为可能吸字
+SHERPA_SILENT_RETRY = 8               # 最多重试次数
+SHERPA_SILENT_SPEED_JITTER = 0.15     # 每次重试对 speed 的最大随机扰动幅度（按比例）
+SHERPA_SPEED_ONLY_RETRY = 3           # 前几次重试只扰动 speed，超过这个次数还失败才改加前缀文本
+SHERPA_FALLBACK_PREFIX = "这个，"      # 触发文本本身的确定性失败时，用这个语气词前缀规避
+
+def _sherpa_detect_bad(g, text):
+    """检测一次 Melo 生成结果是否命中上述两种已知缺陷之一。返回 (is_bad, 诊断信息)。"""
+    import numpy as np
+    samples = np.asarray(g.samples, dtype=np.float64)
+    if not samples.size:
+        return True, "empty"
+    overall_rms = float(np.sqrt(np.mean(samples ** 2)))
+    if overall_rms < SHERPA_SILENT_RMS_THRESHOLD and len(text) > 1:
+        return True, f"整句伪静音 rms={overall_rms:.6f}"
+    head_n = int(g.sample_rate * SHERPA_HEAD_WINDOW_SEC)
+    if len(samples) > head_n * 2:   # 句子至少要比检测窗口长很多，避免短句被误判
+        head_rms = float(np.sqrt(np.mean(samples[:head_n] ** 2)))
+        if head_rms < SHERPA_HEAD_RMS_THRESHOLD and overall_rms >= SHERPA_SILENT_RMS_THRESHOLD:
+            return True, f"句首吸字 head_rms={head_rms:.5f}（整句rms={overall_rms:.5f}）"
+    return False, ""
 
 def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
-    """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。"""
+    """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。
+    对整句伪静音/句首吸字两种已知缺陷做重试保护（详见前面长注释）：
+    先扰动 speed 重试，仍失败则换成加前缀文本重试，全部用尽仍失败则返回短暂静音。"""
     import numpy as np
-    with _sherpa_lock:
-        tts = _load_sherpa_tts()
-        g = tts.generate(text, sid=0, speed=_rate_to_speed(rate))
+    import random
+    base_speed = _rate_to_speed(rate)
+    speed = base_speed
+    g = None
+    is_bad, reason = True, ""
+    used_prefix = False
+    for attempt in range(SHERPA_SILENT_RETRY):
+        cur_text = text
+        if attempt >= SHERPA_SPEED_ONLY_RETRY:
+            cur_text = SHERPA_FALLBACK_PREFIX + text   # speed 扰动无效时，改加前缀改变音素上下文
+            used_prefix = True
+        with _sherpa_lock:
+            tts = _load_sherpa_tts()
+            g = tts.generate(cur_text, sid=0, speed=speed)
+        if not len(g.samples):
+            raise RuntimeError("Melo 未返回音频")
+        is_bad, reason = _sherpa_detect_bad(g, cur_text)
+        if not is_bad:
+            break
+        _log_tts(f"[Melo重试] {reason}（第{attempt + 1}次{'，已加前缀' if used_prefix else ''}）：{text[:30]!r}")
+        speed = base_speed * (1.0 + random.uniform(-SHERPA_SILENT_SPEED_JITTER, SHERPA_SILENT_SPEED_JITTER))
+    if is_bad:
+        _log_tts(f"[Melo重试失败] 重试{SHERPA_SILENT_RETRY}次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+            w.writeframes(b"\x00\x00" * int(44100 * 0.15))   # 150ms 短暂静音，代替伪噪声/吸字
+        return buf.getvalue()
+    samples = _normalize_loudness(g.samples, sample_rate=g.sample_rate)
+    pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(g.sample_rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+# ---- Kokoro-82M 离线语音（sherpa-onnx 支持，中英混读，103 个说话人）----
+# 实测：句间 RMS 波动比 Melo 小（~1~2dB vs Melo 的 ~5~8dB），但中文发音自然度/耐听度
+# 明显低于 Melo（sherpa-onnx 绑定走 espeak-ng 做中文音素化，非 Kokoro 官方的 misaki G2P，
+# 机械感明显），仅作备选音色，不作默认。模型不是逐文件下载，而是单个 tar.bz2（GitHub Releases），下载后解压。
+KOKORO_DIR = "kokoro-int8-multi-lang-v1_1"
+KOKORO_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2"
+# 中文说话人名 -> sid（完整映射见 sherpa-onnx 文档，zf_ 女声/zm_ 男声），这里只登记项目实际用到的几个
+KOKORO_SPEAKERS = {"zf_xiaoxiao": 47, "zf_xiaoyi": 48, "zm_yunxi": 50, "zm_yunjian": 49}
+_kokoro_tts = None
+_kokoro_lock = threading.Lock()   # 同时保护模型加载和合成调用
+
+def kokoro_model_ready() -> bool:
+    return os.path.isfile(os.path.join(APP_DIR, "sherpa_models", KOKORO_DIR, ".complete"))
+
+def _ensure_kokoro_model() -> str:
+    """确保 Kokoro 模型文件齐全（int8 量化版约 140MB，首次需联网），返回模型目录。"""
+    base = os.path.join(APP_DIR, "sherpa_models")
+    d = os.path.join(base, KOKORO_DIR)
+    ok_flag = os.path.join(d, ".complete")
+    if os.path.isfile(ok_flag):
+        return d
+    _log_tts("[离线朗读] 首次使用，正在下载 Kokoro 模型（约 140MB，需联网一次）")
+    os.makedirs(base, exist_ok=True)
+    tmp = os.path.join(base, KOKORO_DIR + ".tar.bz2.part")
+    last_err = None
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(KOKORO_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            with bz2.BZ2File(tmp) as bz, tarfile.open(fileobj=bz) as tf:
+                tf.extractall(base)   # 归档内部已包含 KOKORO_DIR 前缀目录
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0 * (attempt + 1))
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    if last_err is not None:
+        raise RuntimeError(f"离线语音模型（Kokoro）下载失败：{last_err}") from last_err
+    with open(ok_flag, "w") as f:
+        f.write("ok")
+    return d
+
+def _load_kokoro_tts():
+    """调用方须已持有 _kokoro_lock。"""
+    global _kokoro_tts
+    if _kokoro_tts is not None:
+        return _kokoro_tts
+    try:
+        import sherpa_onnx
+    except Exception as e:
+        raise RuntimeError("未安装 sherpa-onnx，请执行：pip install sherpa-onnx") from e
+    d = _ensure_kokoro_model().replace("\\", "/")
+    cfg = sherpa_onnx.OfflineTtsConfig(
+        model=sherpa_onnx.OfflineTtsModelConfig(
+            kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                model=f"{d}/model.int8.onnx", voices=f"{d}/voices.bin",
+                tokens=f"{d}/tokens.txt", data_dir=f"{d}/espeak-ng-data",
+                lexicon=f"{d}/lexicon-us-en.txt,{d}/lexicon-zh.txt"),
+            provider="cpu", num_threads=4, debug=False),
+        rule_fsts=",".join(f"{d}/{f}" for f in ("date-zh.fst", "phone-zh.fst", "number-zh.fst")),
+        max_num_sentences=1)
+    _kokoro_tts = sherpa_onnx.OfflineTts(cfg)
+    return _kokoro_tts
+
+def _kokoro_rate_to_speed(rate: str) -> float:
+    """把 "+10%"/"-25%" 语速档位转成 Kokoro 的 speed（越大越快）。Kokoro 默认语速本身已比
+    Melo 更慢、更自然，不套用 Melo 专属的 MELO_BASE_SPEED 减速系数。"""
+    try:
+        pct = int(str(rate).strip().replace("%", ""))
+    except Exception:
+        pct = 0
+    return max(0.4, min(3.0, 1.0 + pct / 100.0))
+
+def synthesize_tts_kokoro(text: str, speaker: str, rate: str) -> bytes:
+    """离线合成（Sherpa-ONNX Kokoro-82M，中英混读），返回 wav 字节。
+    实测句间響度波动明显小于 Melo，仍保留响度归一化作双保险。"""
+    import numpy as np
+    sid = KOKORO_SPEAKERS.get(speaker, 47)
+    with _kokoro_lock:
+        tts = _load_kokoro_tts()
+        g = tts.generate(text, sid=sid, speed=_kokoro_rate_to_speed(rate))
     if not len(g.samples):
-        raise RuntimeError("Melo 未返回音频")
-    samples = _normalize_loudness(g.samples)
+        raise RuntimeError("Kokoro 未返回音频")
+    samples = _normalize_loudness(g.samples, sample_rate=g.sample_rate)
     pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -232,7 +454,7 @@ def _normalize_wav_bytes(data: bytes) -> bytes:
         sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
     samples = pcm.astype(np.float32) / 32767.0
-    samples = _normalize_loudness(samples)
+    samples = _normalize_loudness(samples, sample_rate=sr)
     out = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -370,7 +592,7 @@ def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> 
             f"<voice name='{voice_name}'><prosody rate='{rate}'>{escape(text)}</prosody></voice></speak>")
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/ssml+xml",
-               "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3", "User-Agent": "PyReader"}
+               "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm", "User-Agent": "PyReader"}
     last_err = None
     for attempt in range(3):
         try:
@@ -395,37 +617,89 @@ def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> 
 
 def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
     """Azure Speech 云端合成，返回 mp3 字节。主账号认证失败/额度用尽/持续限流时自动切换备用账号，
-    出问题的账号会被暂时跳过一段时间，避免每句都先撞一次错误。"""
+    出问题的账号会被暂时跳过一段时间，避免每句都先撞一次错误。所有账号都不可用时，
+    自动回退到 edge-tts（同样的 Neural 音色名，免费但偶发因微软接口变更而失效，仅作补充）。"""
     accts = [dict(a) for a in _azure_accounts]
     if not accts[0]["key"]:
         accts[0] = {"key": os.environ.get("AZURE_SPEECH_KEY", "").strip(),
                     "region": _norm_region(os.environ.get("AZURE_SPEECH_REGION", ""))}
     cand = [i for i, a in enumerate(accts) if a["key"] and a["region"]]
-    if not cand:
-        raise RuntimeError("未配置 Azure Speech：请在设置里填写 Key 和区域（如 eastus）")
-    now = time.time()
-    order = [i for i in cand if _azure_skip_until[i] <= now] or cand   # 都在冷却期则全部再试一遍
     errors = []
-    for i in order:
+    if not cand:
+        errors.append("未配置 Azure Speech Key/区域")
+    else:
+        now = time.time()
+        order = [i for i in cand if _azure_skip_until[i] <= now] or cand   # 都在冷却期则全部再试一遍
+        for i in order:
+            try:
+                return _azure_call(i, accts[i], voice_name, text, rate)
+            except _AzureAccountError as e:
+                _azure_skip_until[i] = time.time() + AZURE_SKIP_SECONDS
+                _log_tts(f"[Azure] 账号{i} 不可用，{AZURE_SKIP_SECONDS // 60} 分钟内跳过：{e}")
+                errors.append(f"账号{i}：{e}")
+    try:
+        _log_tts(f"[Azure] 所有账号不可用，回退到 edge-tts（{voice_name}）")
+        return synthesize_tts_edge(text, voice_name, rate)
+    except Exception as e:
+        errors.append(f"edge-tts 回退也失败：{e}")
+    raise RuntimeError("Azure Speech 所有账号均不可用，edge-tts 回退也失败（" + "；".join(errors) + "）")
+
+_edge_tts_skip_until = 0.0   # edge-tts 端点被封/403 后，暂时跳过的截止时间（秒级时间戳），避免每句都先撞一次错误
+EDGE_TTS_SKIP_SECONDS = 600
+
+def synthesize_tts_edge(text: str, voice_name: str, rate: str) -> bytes:
+    """edge-tts 云端合成（微软 Edge 朗读非官方接口），返回 mp3 字节。免费、无额度限制，
+    但依赖微软内部接口，偶发因对方改鉴权方式而失效（如 2026-10 的 403，需 edge-tts>=7.3.0 修复）。
+    仅作为 Azure 额度用尽/账号不可用时的补充，不作为用户可选的主力音色。"""
+    global _edge_tts_skip_until
+    try:
+        import edge_tts
+    except Exception as e:
+        raise RuntimeError("未安装 edge-tts，请执行：pip install edge-tts") from e
+    now = time.time()
+    if _edge_tts_skip_until > now:
+        raise RuntimeError(f"edge-tts 处于冷却期（还剩 {int(_edge_tts_skip_until - now)} 秒）")
+    # Azure 的 rate（如 "+10%"）与 edge-tts 的 rate 字符串格式一致，可直接复用
+    async def go():
+        com = edge_tts.Communicate(text, voice_name, rate=rate)
+        out = []
+        async for chunk in com.stream():
+            if chunk["type"] == "audio":
+                out.append(chunk["data"])
+        if not out:
+            raise RuntimeError("edge-tts 未返回音频")
+        return b"".join(out)
+    last_err = None
+    for attempt in range(3):
         try:
-            return _azure_call(i, accts[i], voice_name, text, rate)
-        except _AzureAccountError as e:
-            _azure_skip_until[i] = time.time() + AZURE_SKIP_SECONDS
-            _log_tts(f"[Azure] 账号{i} 不可用，{AZURE_SKIP_SECONDS // 60} 分钟内跳过：{e}")
-            errors.append(f"账号{i}：{e}")
-    raise RuntimeError("Azure Speech 所有账号均不可用，请检查 Key、区域和额度（" + "；".join(errors) + "）")
+            return asyncio.run(go())
+        except Exception as e:
+            last_err = e
+            _log_tts(f"[edge-tts重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{e}")
+            time.sleep(0.6 * (attempt + 1))
+    _edge_tts_skip_until = time.time() + EDGE_TTS_SKIP_SECONDS   # 连续失败多半是端点被封，冷却一段时间再试
+    raise RuntimeError(f"edge-tts 合成失败（已重试3次）：{last_err}")
 
 # 离线引擎（Melo/Piper）词表里没有的标点/符号 → 换成有停顿的等价标点或删除。
 # 否则这些字符会被当成 OOV 静默丢弃（如 '…'），导致该有的停顿消失、语句粘连。
 # 注意键的顺序：先匹配更长的（“……”→“，”在“…”→“，”之前，“——”在“—”之前）。
 _TTS_PUNCT_REPLACE = {
     "……": "，", "…": "，", "‥": "，", "⋯": "，",
-    "——": "，", "―": "，", "—": "，",
+    "——": "，", "―": "，", "—": "，", "–": "，",
     "～": "，", "~": "，",
+    "：": "，", "；": "，",   # 全角冒号/分号：Melo 词表里没有，不换成停顿会被静默丢弃导致语句粘连
+    ":": "，", ";": "，",       # 半角冒号/分号（中文文本里混用半角标点常见），同样是 OOV
     "“": "", "”": "", "‘": "", "’": "",
+    '"': "", "'": "",         # ASCII 直引号（很多 txt 小说文本用这种而不是中文弯引号），同样是 OOV，
+                              # 且连续多个直引号会让整句只剩下引号本身，触发 Melo 整句转换失败（Failed to convert）
     "·": " ",            # 外国人名中点 → 空格（如 阿加莎·克里斯蒂）
     "《": "", "》": "", "〈": "", "〉": "",
     "（": " ", "）": " ", "【": " ", "】": " ", "〔": " ", "〕": " ",
+    "℃": "度", "℉": "度",      # 摄氏度/华氏度符号 → “度”，保留语义而不是直接丢字
+    "±": "", "°": "度", "※": "，", "•": "，", "′": "", "″": "",
+    # 半角符号/标点：Melo 词表不认，全部会被静默丢弃
+    "/": " ", "\\": " ", "|": "，", "@": " ", "#": " ", "$": " ",
+    "%": " ", "^": " ", "&": " ", "*": " ",
 }
 
 def _normalize_tts_text(text: str) -> str:
@@ -435,11 +709,23 @@ def _normalize_tts_text(text: str) -> str:
     return text
 
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
-    """把一段文本合成音频字节。voice 以 "sherpa:" 走本地 Melo 离线合成（wav，中英混读），
-    以 "piper:" 开头走本地 Piper 离线合成（wav，仅英文），以 "azure:" 走 Azure Speech 云端合成（mp3）。"""
+    """把一段文本合成音频字节。voice 以 "kokoro:" 走本地 Kokoro-82M 离线合成（wav，中英混读，推荐），
+    以 "sherpa:" 走本地 Melo 离线合成（wav，中英混读），以 "piper:" 开头走本地 Piper 离线合成
+    （wav，仅英文），以 "azure:" 走 Azure Speech 云端合成（mp3）。"""
     if voice.startswith("azure:"):
         return synthesize_tts_azure(text, voice[len("azure:"):], rate)
     text = _normalize_tts_text(text)   # 离线引擎：先归一化标点，避免 OOV 字符被静默丢弃
+    if not text.strip():
+        # 归一化后只剩空白（如原句全是引号/标点，被替换成空字符串后只剩换行符），离线引擎
+        # 会报 "Failed to convert" 而不是返回音频，这里直接返回一段极短静音，避免中断朗读。
+        import struct
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+            w.writeframes(struct.pack("<h", 0) * 100)   # ~2.3ms 静音
+        return buf.getvalue()
+    if voice.startswith("kokoro:"):
+        return synthesize_tts_kokoro(text, voice[len("kokoro:"):], rate)
     if voice.startswith("sherpa:") or voice == "piper:zh_CN-huayan-medium":   # 旧配置里的 Piper 中文音色迁移到 Melo
         return synthesize_tts_sherpa(text, rate)
     if voice.startswith("piper:"):
