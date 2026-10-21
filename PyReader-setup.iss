@@ -1,9 +1,9 @@
-; PyReader — Inno Setup 安装脚本
+﻿; PyReader — Inno Setup 安装脚本
 ; 用法：ISCC.exe PyReader-setup.iss
 ; 产物：release\PyReader-Setup-<版本>.exe
 
 #define MyAppName "PyReader"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "garyliu"
 #define MyAppExeName "PyReader.exe"
 
@@ -40,8 +40,12 @@ Name: "fileassoc"; Description: "关联电子书文件（epub / mobi / azw / azw
 
 [Files]
 Source: "dist\PyReader\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 离线 TTS 模型（Melo / Kokoro / Piper），随程序一体分发，安装后无需联网即可离线朗读
+Source: "installer_models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs nocompression
 ; 附带说明文档（若存在）
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion; 
+; AI 密钥配置（DeepSeek 翻译 / Azure Speech 朗读），开箱即用
+Source: ".env"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
