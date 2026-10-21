@@ -226,65 +226,84 @@ def reset_loudness_state():
 #      “谢谢，部长先生，那么……”这种，句首——对应“谢谢”两字——被模型吸掉，实测发现有些文本
 #      在按 speed 重试时甚至 100% 固定失败，说明这不是随机种子问题，而是文本本身触发的确定性 bug。
 # 对策略分两步：
-#   第 1~3 次重试：只扰动 speed（±15%，人耳难以察觉），对部分「真随机」失败有效且不改变听感。
-#   第 4 次起：若仍失败（说明是文本触发的固定性 bug，speed 扰动无效），改在文本前加一个有实际
-#      发音内容的语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
+#   第 1 次重试：只扰动 speed（±15%，人耳难以察觉），对「真随机」失败有效且不改变听感。
+#   第 2 次重试：若仍失败（说明是文本触发的固定性 bug），改在文本前加一个有实际发音内容的
+#      语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
 #      改变音素上下文来规避这个确定性缺陷。代价是听到一个多余的语气词开头，但远比关键内容完全丢失好。
 #      注意：纯标点（逗号/句号）完全无效，必须是实词，因为标点本身不产生音素。
-# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值设在 1e-4 足够可靠地区分。
-# 句首吸字样本句首段 rms 在 0.002~0.01，正常句首在 0.02 以上，阈值设在 0.015 区分。
+# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值 1e-4 足够区分。
+#
+# 句首吞字的判据【2026-10-21 修改】：从绝对阈值 head_rms < 0.015 改为相对占比。
+# 原因：Melo 正常发音带 ~50~250ms 起音淡入，加上擦音/鼻音起头（“世上/掍着/满/将军/谢谢”），
+# 实测正常句子的 head_rms 落在 0.005~0.017，与真·吞字（0.0027）区间重叠 → 大量误判。
+# 误判的代价是每次白跑 3~8 次重合成（实测单句 10~40 秒），听感上就是“读着读着长时间静音”。
+# 改判「前 250ms 能量占整句能量的比例」：
+#   正常句实测 22 个样本：0.147~0.565
+#   真·吞字（“谢谢，部长先生…” 那次提交的复现用例）：0.084
+# 阈值 0.12 能把两者分开，且不依赖录音电平（换音色/音量都成立）。
 SHERPA_SILENT_RMS_THRESHOLD = 0.0001
-SHERPA_HEAD_WINDOW_SEC = 0.25         # 检测句首吸字的窗口长度（秒）
-SHERPA_HEAD_RMS_THRESHOLD = 0.015     # 句首窗口 RMS 低于此值视为可能吸字
-SHERPA_SILENT_RETRY = 8               # 最多重试次数
-SHERPA_SILENT_SPEED_JITTER = 0.15     # 每次重试对 speed 的最大随机扰动幅度（按比例）
-SHERPA_SPEED_ONLY_RETRY = 3           # 前几次重试只扰动 speed，超过这个次数还失败才改加前缀文本
-SHERPA_FALLBACK_PREFIX = "这个，"      # 触发文本本身的确定性失败时，用这个语气词前缀规避
+SHERPA_HEAD_WINDOW_SEC = 0.25               # 检测句首吞字的窗口长度（秒）
+SHERPA_HEAD_RATIO_THRESHOLD = 0.12          # 句首 250ms 能量 / 整句能量 低于此值视为吞噬
+SHERPA_SILENT_RETRY = 8                     # 整句伪静音的预算：多是单字/短句（单次 1~3s），多试几次代价小
+SHERPA_HEAD_RETRY = 2                       # 句首吞字的预算：多是长句（单次 9~12s），多试一次就是十几秒静音
+SHERPA_SILENT_SPEED_JITTER = 0.15           # 每次重试对 speed 的最大随机扰动幅度（按比例）
+SHERPA_SPEED_ONLY_RETRY = 3                 # 整句伪静音：前 3 次只扰动 speed，再失败才加前缀
+SHERPA_HEAD_PREFIX_AT = 1                   # 句首吞字：第 2 次直接用前缀（speed 扰动对它无效）
+SHERPA_FALLBACK_PREFIX = "这个，"            # 触发文本本身的确定性失败时，用这个语气词前缀规避
 
 def _sherpa_detect_bad(g, text):
-    """检测一次 Melo 生成结果是否命中上述两种已知缺陷之一。返回 (is_bad, 诊断信息)。"""
+    """检测一次 Melo 生成结果是否命中已知缺陷。返回 (is_bad, 诊断信息, 类型)。
+    类型为 "silent"（整句伪静音）或 "head"（句首吞字），两种缺陷的重试预算不同。"""
     import numpy as np
     samples = np.asarray(g.samples, dtype=np.float64)
     if not samples.size:
-        return True, "empty"
+        return True, "empty", "silent"
     overall_rms = float(np.sqrt(np.mean(samples ** 2)))
     if overall_rms < SHERPA_SILENT_RMS_THRESHOLD and len(text) > 1:
-        return True, f"整句伪静音 rms={overall_rms:.6f}"
+        return True, f"整句伪静音 rms={overall_rms:.6f}", "silent"
     head_n = int(g.sample_rate * SHERPA_HEAD_WINDOW_SEC)
     if len(samples) > head_n * 2:   # 句子至少要比检测窗口长很多，避免短句被误判
         head_rms = float(np.sqrt(np.mean(samples[:head_n] ** 2)))
-        if head_rms < SHERPA_HEAD_RMS_THRESHOLD and overall_rms >= SHERPA_SILENT_RMS_THRESHOLD:
-            return True, f"句首吸字 head_rms={head_rms:.5f}（整句rms={overall_rms:.5f}）"
-    return False, ""
+        ratio = head_rms / max(overall_rms, 1e-9)
+        if ratio < SHERPA_HEAD_RATIO_THRESHOLD:
+            return True, f"句首能量占比过低 head/整句={ratio:.3f}（head_rms={head_rms:.5f}）", "head"
+    return False, "", ""
 
 def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
     """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。
-    对整句伪静音/句首吸字两种已知缺陷做重试保护（详见前面长注释）：
-    先扰动 speed 重试，仍失败则换成加前缀文本重试，全部用尽仍失败则返回短暂静音。"""
+
+    对两种已知缺陷做重试保护（详见前面长注释），但两者预算分开：
+      - 整句伪静音（多为单字/短句，单次 1~3s）→ 最多 8 次，前 3 次只扰动 speed；
+      - 句首吞字（多为长句，单次 9~12s）→ 最多 2 次，第 2 次直接加前缀。
+    长句多试几次的代价是十几秒静音，比“偶尔吞一个字”更伤体验，所以句首类快速止血。"""
     import numpy as np
     import random
     base_speed = _rate_to_speed(rate)
     speed = base_speed
     g = None
-    is_bad, reason = True, ""
+    is_bad, reason, kind = True, "", "silent"
     used_prefix = False
-    for attempt in range(SHERPA_SILENT_RETRY):
-        cur_text = text
-        if attempt >= SHERPA_SPEED_ONLY_RETRY:
-            cur_text = SHERPA_FALLBACK_PREFIX + text   # speed 扰动无效时，改加前缀改变音素上下文
-            used_prefix = True
+    attempt = 0
+    while True:
+        budget = SHERPA_SILENT_RETRY if kind == "silent" else SHERPA_HEAD_RETRY
+        prefix_at = SHERPA_SPEED_ONLY_RETRY if kind == "silent" else SHERPA_HEAD_PREFIX_AT
+        cur_text = SHERPA_FALLBACK_PREFIX + text if attempt >= prefix_at else text
+        used_prefix = attempt >= prefix_at
         with _sherpa_lock:
             tts = _load_sherpa_tts()
             g = tts.generate(cur_text, sid=0, speed=speed)
         if not len(g.samples):
             raise RuntimeError("Melo 未返回音频")
-        is_bad, reason = _sherpa_detect_bad(g, cur_text)
+        is_bad, reason, kind = _sherpa_detect_bad(g, cur_text)
         if not is_bad:
             break
         _log_tts(f"[Melo重试] {reason}（第{attempt + 1}次{'，已加前缀' if used_prefix else ''}）：{text[:30]!r}")
+        attempt += 1
+        if attempt >= budget:      # 该类缺陷的预算用尽 → 不再硬试
+            break
         speed = base_speed * (1.0 + random.uniform(-SHERPA_SILENT_SPEED_JITTER, SHERPA_SILENT_SPEED_JITTER))
     if is_bad:
-        _log_tts(f"[Melo重试失败] 重试{SHERPA_SILENT_RETRY}次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
+        _log_tts(f"[Melo重试失败] {attempt} 次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
