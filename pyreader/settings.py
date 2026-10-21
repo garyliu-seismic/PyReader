@@ -69,6 +69,9 @@ class SettingsDialog(QDialog):
         self.tts_rate.addItems(TTS_RATES)
         ri = self.tts_rate.findText(cfg.get("tts_rate", "+0%"))
         self.tts_rate.setCurrentIndex(ri if ri >= 0 else 3)
+        # 网络代理：Reader 只认这里（不读 Windows 系统代理/注册表），留空 = 直连
+        self.proxy = QLineEdit(cfg.get("proxy", ""))
+        self.proxy.setPlaceholderText("如 http://127.0.0.1:1081（sing-box mixed 入站）；留空 = 直连")
         # 双语朗读（朗读时 AI 翻译）
         self.bilingual = QCheckBox("朗读时自动翻译并显示")
         self.bilingual.setChecked(bool(cfg.get("bilingual", False)))
@@ -112,6 +115,7 @@ class SettingsDialog(QDialog):
         form.addRow("双语朗读", QLabel("（朗读时 AI 翻译，需 API Key）"))
         form.addRow("双语翻译", self.bilingual)
         form.addRow("翻译目标", self.bilingual_target)
+        form.addRow("网络代理", self.proxy)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
         form.addRow(btn)

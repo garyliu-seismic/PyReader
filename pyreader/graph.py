@@ -15,7 +15,7 @@ import html as _html
 import os
 import urllib.request
 from pathlib import Path
-from .config import APP_DIR
+from .config import APP_DIR, net_urlopen
 
 # vis-network 离线缓存路径
 _VIS_CACHE = Path(APP_DIR) / "vis-network.min.js"
@@ -33,7 +33,7 @@ def _ensure_vis_js() -> str:
     for url in (_VIS_URL, _VIS_URL2):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with net_urlopen(req, timeout=15) as r:
                 data = r.read()
             if len(data) > 100_000:
                 _VIS_CACHE.write_bytes(data)

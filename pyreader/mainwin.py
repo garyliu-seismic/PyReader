@@ -13,7 +13,7 @@ from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUT
                      load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA,
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
-                     FLIP_EFFECTS, DEFAULT_FLIP_EFFECT)
+                     FLIP_EFFECTS, DEFAULT_FLIP_EFFECT, set_net_proxy)
 from .ttsplayer import TtsPlayer
 from .markdown import md_chapters, MD_HEAD_RE
 from .textio import MD_EXTS
@@ -36,6 +36,8 @@ class MainWindow(QMainWindow):
         _saved = load_json(CONFIG_PATH, {})
         _env   = load_env_defaults() if not _saved.get("api_key") else {}
         self.cfg = {**DEFAULT_CONFIG, **_env, **_saved}
+        # Reader 用自己的代理策略（不读 Windows 系统代理），见 config.net_urlopen
+        set_net_proxy(self.cfg.get("proxy") or os.environ.get("PYREADER_PROXY", ""))
         set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
                          self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
         if self.cfg.get("tts_voice") not in {v for _, v in TTS_VOICES}:   # 已下线的 edge-tts 音色 → 默认音色
@@ -129,7 +131,7 @@ class MainWindow(QMainWindow):
         self.tts_epoch = 0            # 章节代际，用于忽略过期合成结果
         self.tts_sentences = []       # [(start, end, text)]
         self.tts_idx = 0
-        self.tts_cache = {}           # seq -> mp3 字节
+        self.tts_cache = {}           # seq -> 音频字节（wav）
         self.tts_inflight = set()
         self.tts_workers = {}         # seq -> TtsWorker（防止信号前被 GC）
         self.tts_failed_seqs = set()  # 本章内合成失败的句子（跳过，不重试）
@@ -492,6 +494,7 @@ class MainWindow(QMainWindow):
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
+                "proxy": dlg.proxy.text().strip(),
                 "azure_tts_key": dlg.azure_key.text().strip(),
                 "azure_tts_region": dlg.azure_region.text().strip(),
                 "azure_tts_key2": dlg.azure_key2.text().strip(),
@@ -502,6 +505,7 @@ class MainWindow(QMainWindow):
                 "bilingual_target": dlg.bilingual_target.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
+            set_net_proxy(self.cfg["proxy"])
             set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
                          self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
             self._apply_theme(self.cfg["theme"])
