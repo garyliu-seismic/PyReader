@@ -246,3 +246,20 @@ def test_image_only_slide_no_visible_heading(tmp_path):
     starts = [b["start"] for b in blocks]
     assert starts == sorted(set(starts))
     assert chapters[0][0] == 0 and text.startswith("Before\n")
+
+
+def test_page_numbers_not_char_based_for_image_only_deck(tmp_path):
+    """页码总数不能按「全文字数 / 章均字数」估算：图片页每页仅 1 字符会得到上千页。"""
+    pytest.importorskip("PySide6")
+    from pyreader.pager import LazyPager
+    prs = Presentation()
+    for i in range(20):
+        _set_pic_bg(prs.slides.add_slide(prs.slide_layouts[6]), _png_color((i, i, i)))
+    prs.save(str(tmp_path / "img.pptx"))
+    text, chapters, _, extra = load_pptx(str(tmp_path / "img.pptx"))
+    pg = LazyPager(text, chapters, pdf_blocks=extra["blocks"])
+    pg._npages[3] = 1                       # 模拟已排版 1 个图片章节（每页 1 字符）
+    cur, total = pg.page_info(10, 0)
+    assert (cur, total) == (11, 20)
+    pg._npages[10] = 2                      # 某章实际排成 2 页 → 总数与当前页随之校正
+    assert pg.page_info(11, 0) == (13, 21)

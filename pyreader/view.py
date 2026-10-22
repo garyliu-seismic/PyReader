@@ -62,6 +62,8 @@ class PageView(QWidget):
         self.book_title = ""
         self.chapter_title = ""
         self.chars_per_page = 400.0
+        self.page_info = None     # 可选 callable(chapter_idx, page_idx) -> (页码, 总页数)
+        self.chapter_index = 0
         self.setMouseTracking(True)
         self.setMinimumSize(600, 500)
         # 触摸板/触摸屏手势翻页
@@ -773,8 +775,11 @@ class PageView(QWidget):
                        header_text)
             p.setFont(self.font)
         # 页码（底部居中：当前 / 总页数）
-        pg = max(1, int(page.start / max(1.0, self.chars_per_page)) + 1)
-        total = max(1, int(len(self.full_text) / max(1.0, self.chars_per_page)))
+        if self.page_info is not None:
+            pg, total = self.page_info(self.chapter_index, page.index)
+        else:
+            pg = max(1, int(page.start / max(1.0, self.chars_per_page)) + 1)
+            total = max(1, int(len(self.full_text) / max(1.0, self.chars_per_page)))
         pf = QFont(self.font); pf.setPointSize(max(9, self.font.pointSize() - 4))
         p.setFont(pf); p.setPen(QColor(self.pageno_color))
         p.drawText(QRectF(rect.left(), rect.bottom() - self.margin_y + 10, rect.width(), self.margin_y - 18),

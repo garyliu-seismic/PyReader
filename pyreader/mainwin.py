@@ -347,6 +347,8 @@ class MainWindow(QMainWindow):
             self.view._img_cache.clear()
             self.pager = LazyPager(text, chapters, md=is_md, pdf_blocks=pdf_blocks)
         self.pager.set_params(self.view.pagination_params())
+        # 版式块文档（PDF/DOCX/PPTX）用真实页数计页码；纯文本/EPUB 仍按字数估算
+        self.view.page_info = self.pager.page_info if (not self.view.scan_mode and extra.get("blocks") is not None and not is_md) else None
         self.view.full_text = text
         self.view.book_title = title or os.path.splitext(os.path.basename(self.book_path))[0]
         self._build_toc()
@@ -363,6 +365,7 @@ class MainWindow(QMainWindow):
             return
         ci = max(0, min(len(self.pager.chapters) - 1, ci))
         self.cur_chapter = ci
+        self.view.chapter_index = ci
         self.view.cancel_flip()
         self.view.pages = self.pager.pages_of(ci)      # 只分这一章，毫秒级
         self.view.chapter_title = self.pager.chapters[ci].title
