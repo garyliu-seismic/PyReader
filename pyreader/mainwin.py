@@ -2,7 +2,7 @@ import os
 import re
 import threading
 from typing import Optional
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetItem,
                                QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel,
@@ -13,7 +13,7 @@ from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUT
                      load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA,
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
-                     FLIP_EFFECTS, DEFAULT_FLIP_EFFECT)
+                     FLIP_EFFECTS, DEFAULT_FLIP_EFFECT, set_net_proxy)
 from .ttsplayer import TtsPlayer
 from .markdown import md_chapters, MD_HEAD_RE
 from .textio import MD_EXTS
@@ -26,16 +26,47 @@ from .ai import (translate, lookup, AiWorker,
                   continue_story, analyze_sentiment, explain_background,
                   extract_knowledge_graph)
 from .graph import build_graph_html
-from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_VOICES, TTS_DEFAULT_VOICE, _log_tts, set_azure_config, sherpa_model_ready, kokoro_model_ready, reset_loudness_state
+from .tts import TtsWorker, TranslateWorker, split_sentences, synthesize_tts, TTS_VOICES, TTS_DEFAULT_VOICE, _log_tts, set_azure_config, sherpa_model_ready, kokoro_model_ready, reset_loudness_state
 
 # ============ 主窗口 ============
+
+# 朗读预取深度（句）。Melo 合成约 0.87× 实时、且按句长波动很大（短句 0.7s、长句 7s），
+# 只预取 1 句时缓冲没有余量：短句后面跟长句必然露白 5 秒以上。维持 3 句缓冲可吸收这种波动。
+TTS_PREFETCH = 3
+
+
+def _set_reading_priority(high: bool):
+    """朗读期间把进程优先级提到 ABOVE_NORMAL，结束后恢复。
+
+    Melo 合成是纯 CPU 计算（VITS 解码）。后台服务（SearchIndexer / Defender / node）
+    抢核时实测 rtf 从 0.87 掉到 1.4~1.6，而 rtf>1 时任何预取缓冲都补不回来（只能出静音）。
+    提优先级不改变模型开销，但能让合成线程稳定拿到 CPU。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ABOVE_NORMAL, NORMAL = 0x8000, 0x20
+        k32 = ctypes.windll.kernel32
+        k32.SetPriorityClass(k32.GetCurrentProcess(), ABOVE_NORMAL if high else NORMAL)
+    except Exception:
+        pass
+
+
 class MainWindow(QMainWindow):
+    # 合成线程 → 主线程的结果通道
+    # （Qt 对象只能在主线程碰：QAudioSink / QTimer / UI 都必须在主线程，
+    #   合成完成时从后台线程 emit，靠 QueuedConnection 排回主线程）
+    ttsSynthReady = Signal(int, int, bytes)   # (epoch, seq, wav)
+    ttsSynthFailed = Signal(int, int, str)    # (epoch, seq, 错误信息)
+
     def __init__(self, book_path=None):
         super().__init__()
         # 优先级：DEFAULT_CONFIG < coding-agent/.env < 用户已保存的 config.json
         _saved = load_json(CONFIG_PATH, {})
         _env   = load_env_defaults() if not _saved.get("api_key") else {}
         self.cfg = {**DEFAULT_CONFIG, **_env, **_saved}
+        # Reader 用自己的代理策略（不读 Windows 系统代理），见 config.net_urlopen
+        set_net_proxy(self.cfg.get("proxy") or os.environ.get("PYREADER_PROXY", ""))
         set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
                          self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
         if self.cfg.get("tts_voice") not in {v for _, v in TTS_VOICES}:   # 已下线的 edge-tts 音色 → 默认音色
@@ -129,10 +160,16 @@ class MainWindow(QMainWindow):
         self.tts_epoch = 0            # 章节代际，用于忽略过期合成结果
         self.tts_sentences = []       # [(start, end, text)]
         self.tts_idx = 0
-        self.tts_cache = {}           # seq -> mp3 字节
+        self.tts_cache = {}           # seq -> 音频字节（wav）
         self.tts_inflight = set()
         self.tts_workers = {}         # seq -> TtsWorker（防止信号前被 GC）
         self.tts_failed_seqs = set()  # 本章内合成失败的句子（跳过，不重试）
+        self.tts_pending = []         # 待合成序号 FIFO（由单一线程消费，保证先播的先合成）
+        self.tts_pending_lock = threading.Lock()
+        self.tts_pending_event = threading.Event()   # 有新任务时唤醒合成线程
+        self.tts_dispatcher = None    # 合成线程
+        self.ttsSynthReady.connect(self._tts_on_ready, Qt.ConnectionType.QueuedConnection)
+        self.ttsSynthFailed.connect(self._tts_on_failed, Qt.ConnectionType.QueuedConnection)
         self.bilingual_on = bool(self.cfg.get("bilingual", False))
         self.tr_cache = {}            # seq -> 译文
         self.tr_inflight = set()
@@ -492,6 +529,7 @@ class MainWindow(QMainWindow):
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
+                "proxy": dlg.proxy.text().strip(),
                 "azure_tts_key": dlg.azure_key.text().strip(),
                 "azure_tts_region": dlg.azure_region.text().strip(),
                 "azure_tts_key2": dlg.azure_key2.text().strip(),
@@ -502,6 +540,7 @@ class MainWindow(QMainWindow):
                 "bilingual_target": dlg.bilingual_target.currentText(),
             })
             save_json(CONFIG_PATH, self.cfg)
+            set_net_proxy(self.cfg["proxy"])
             set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
                          self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
             self._apply_theme(self.cfg["theme"])
@@ -812,6 +851,7 @@ class MainWindow(QMainWindow):
             return
         self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
         self.tts_on = True; self.tts_paused = False
+        _set_reading_priority(True)
         reset_loudness_state()   # 新一次朗读清空跨句增益平滑状态，避免上一次朗读的增益残留影响这次开头几句
         self._update_tts_actions()
         if self._tts_load_chapter(self.cur_chapter, start_off=self.view.left_page_offset()):
@@ -838,6 +878,8 @@ class MainWindow(QMainWindow):
         self.tts_epoch += 1            # 换章：旧缓存/在途结果全部作废
         self.tts_cache.clear(); self.tts_inflight.clear(); self.tts_workers.clear()
         self.tts_failed_seqs.clear()
+        with self.tts_pending_lock:
+            self.tts_pending.clear()
         self.tr_cache.clear(); self.tr_inflight.clear(); self.tr_workers.clear()
         return bool(sents)
 
@@ -870,29 +912,90 @@ class MainWindow(QMainWindow):
         if data is not None:
             self._tts_play_data(seq, data)
         else:
+            # 还没合成好：先把后续几句排进队列（避免出现"等合成"的空白）
             self._tts_kick(seq)
-        nxt = seq + 1
-        if nxt < len(self.tts_sentences) and nxt not in self.tts_cache and nxt not in self.tts_inflight:
-            self._tts_kick(nxt)
-        if self.bilingual_on and nxt < len(self.tts_sentences):
-            self._tr_kick(nxt)
+            self.statusBar().showMessage(
+                f"⚙️ 合成中… 第{self.tts_chapter + 1}章 · {seq + 1}/{len(self.tts_sentences)}句")
+        self._tts_fill()
+        if self.bilingual_on:
+            nxt = seq + 1
+            if nxt < len(self.tts_sentences):
+                self._tr_kick(nxt)
+
+    def _tts_fill(self):
+        """把「当前句之后 TTS_PREFETCH 句」排进合成队列。
+
+        原来只预取下一句（nxt = seq + 1），而 Melo 合成速度约 0.87×实时、且按句长波动很大：
+        短句（如“他走了。”0.8s）后面跟一个长句（需 6s 合成）时，露白 = 6 - 0.8 ≈ 5.2 秒。
+        改成维持 3 句的缓冲后，队列天然吸收这种波动。"""
+        if not self.tts_on or not self.tts_sentences:
+            return
+        end = min(len(self.tts_sentences), self.tts_idx + TTS_PREFETCH + 1)
+        for seq in range(self.tts_idx, end):
+            self._tts_kick(seq)
 
     def _tts_kick(self, seq):
-        if seq in self.tts_inflight or seq in self.tts_cache:
+        """把某一句排进合成队列（实际合成由单一后台线程按 FIFO 消费）。"""
+        if seq in self.tts_inflight or seq in self.tts_cache or seq in self.tts_failed_seqs:
             return
-        _, _, text = self.tts_sentences[seq]
-        clean = re.sub(r"\s+", " ", text).strip()
-        if not clean:
+        if seq >= len(self.tts_sentences):
             return
-        self.tts_inflight.add(seq)
-        epoch = self.tts_epoch
-        w = TtsWorker(seq, clean,
-                      self.cfg.get("tts_voice", TTS_DEFAULT_VOICE),
-                      self.cfg.get("tts_rate", "+0%"))
-        w.ready.connect(lambda s, d, ep=epoch: self._tts_on_ready(ep, s, d))
-        w.failed.connect(lambda s, m, ep=epoch: self._tts_on_failed(ep, s, m))
-        self.tts_workers[(epoch, seq)] = w  # 保持引用，防止队列信号前被 GC
-        threading.Thread(target=w.run, daemon=True).start()
+        with self.tts_pending_lock:
+            if seq in self.tts_pending:
+                return
+            self.tts_pending.append(seq)
+        self.tts_pending_event.set()             # 唤醒合成线程
+        self._tts_start_dispatcher()
+
+    def _tts_start_dispatcher(self):
+        """只创建一个常驻合成线程（daemon），开销为 0（空闲时阻塞在 Event 上）。
+
+        不用"队列空了就退出、有活再重建"的写法：那样在"线程即将退出"与"主线程刚好入队"之间
+        有竞争窗口，漏掉一次唤醒就是几百毫秒到几秒的停顿。"""
+        if self.tts_dispatcher is not None and self.tts_dispatcher.is_alive():
+            return
+        self.tts_dispatcher = threading.Thread(target=self._tts_dispatch_loop, daemon=True)
+        self.tts_dispatcher.start()
+
+    def _tts_claim(self):
+        """从待合成队列里取下一个（最小序号），标记为 inflight；队列空返回 None。"""
+        with self.tts_pending_lock:
+            while self.tts_pending:
+                s = min(self.tts_pending)
+                self.tts_pending.remove(s)
+                if s in self.tts_inflight or s in self.tts_cache or s in self.tts_failed_seqs:
+                    continue                      # 已不需要（已合成/已失败/在途）
+                if s >= len(self.tts_sentences):
+                    continue
+                clean = re.sub(r"\s+", " ", self.tts_sentences[s][2]).strip()
+                if not clean:
+                    continue
+                self.tts_inflight.add(s)
+                return s, self.tts_epoch, clean
+        return None
+
+    def _tts_dispatch_loop(self):
+        """单一常驻合成线程：按序号 FIFO 合成，保证"先播的句子先合成"。
+
+        以前是每句起一个线程，但 Melo/Kokoro 的模型调用本来就被 _sherpa_lock 串行化，
+        多线程只会让排队顺序不可控（恰好当前句被排到最后 → 又变成停顿）。"""
+        while True:
+            self.tts_pending_event.wait()        # 无任务时阻塞，不占 CPU
+            self.tts_pending_event.clear()
+            while True:
+                job = self._tts_claim()
+                if job is None:
+                    break
+                seq, epoch, clean = job
+                try:
+                    data = synthesize_tts(clean,
+                                          self.cfg.get("tts_voice", TTS_DEFAULT_VOICE),
+                                          self.cfg.get("tts_rate", "+0%"))
+                except Exception as e:
+                    # 信号是 QueuedConnection：回到主线程后才改 inflight/缓存/播放
+                    self.ttsSynthFailed.emit(epoch, seq, str(e))
+                    continue
+                self.ttsSynthReady.emit(epoch, seq, data)
 
     def _tts_on_ready(self, epoch, seq, data):
         if not self.tts_on or epoch != self.tts_epoch:
@@ -903,6 +1006,7 @@ class MainWindow(QMainWindow):
             self._tts_play_data(seq, data)     # 当前句：直接播，不入缓存
         else:
             self.tts_cache[seq] = data         # 预取句：先缓存
+        self._tts_fill()                        # 存好一句就顺手把窗口补满
 
     def _tts_play_data(self, seq, data):
         if not self.tts_on or seq != self.tts_idx:
@@ -936,16 +1040,21 @@ class MainWindow(QMainWindow):
         if seq == self.tts_idx:      # 当前句失败 → 直接读下一句
             self.statusBar().showMessage(f"跳过无法朗读的句子（{seq + 1}/{len(self.tts_sentences)}）")
             self._tts_advance()
+        else:
+            self._tts_fill()         # 预取句失败 → 把窗口补满
 
     def _tts_stop(self, finished=False):
         was_on = self.tts_on
         self.tts_on = False; self.tts_paused = False
+        _set_reading_priority(False)
         self.tts_idx = 0
         self.tts_chapter = self.cur_chapter
         self.tts_epoch += 1
         self.tts_sentences = []
         self.tts_cache = {}; self.tts_inflight = set(); self.tts_workers = {}
         self.tts_failed_seqs = set()
+        with self.tts_pending_lock:
+            self.tts_pending.clear()
         self.tr_cache = {}; self.tr_inflight = set(); self.tr_workers = {}
         if self.player:
             self.player.stop()

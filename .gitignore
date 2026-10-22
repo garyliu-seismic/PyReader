@@ -24,3 +24,8 @@ _test_img.png
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 离线 TTS 模型（Melo/Kokoro/Piper，合计约 450MB，不入库；安装包构建时由 prep_models.py 预置）
+installer_models/
+models/
+prep_models.log

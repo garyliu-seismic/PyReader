@@ -6,9 +6,10 @@ import asyncio
 import threading
 import bz2
 import tarfile
+import http.client
 import urllib.request
 from PySide6.QtCore import QObject, Signal
-from .config import APP_DIR
+from .config import APP_DIR, bundled_models_dir, net_urlopen
 from .ai import translate_to
 
 # ============ 语音朗读（Melo/Kokoro 离线 / Azure Speech / Piper 离线英文） ============
@@ -62,8 +63,16 @@ SHERPA_MELO_FILES = [
 _sherpa_tts = None
 _sherpa_lock = threading.Lock()   # 同时保护模型加载和合成调用
 
+def _sherpa_model_dirs() -> list:
+    """候选 Melo 模型目录：用户目录优先（可增量更新），其次随程序附带的离线模型目录。"""
+    dirs = [os.path.join(APP_DIR, "sherpa_models", SHERPA_MELO_DIR)]
+    b = bundled_models_dir()
+    if b:
+        dirs.append(os.path.join(b, "sherpa_models", SHERPA_MELO_DIR))
+    return dirs
+
 def sherpa_model_ready() -> bool:
-    return os.path.isfile(os.path.join(APP_DIR, "sherpa_models", SHERPA_MELO_DIR, ".complete"))
+    return any(os.path.isfile(os.path.join(d, ".complete")) for d in _sherpa_model_dirs())
 
 def _ensure_sherpa_model() -> str:
     """确保 Melo 模型文件齐全（约 190MB，首次需联网），返回模型目录。镜像单文件偶发失败，逐个重试。"""
@@ -71,6 +80,12 @@ def _ensure_sherpa_model() -> str:
     ok_flag = os.path.join(d, ".complete")
     if os.path.isfile(ok_flag):
         return d
+    b = bundled_models_dir()
+    if b:
+        bundled = os.path.join(b, "sherpa_models", SHERPA_MELO_DIR)
+        if os.path.isfile(os.path.join(bundled, ".complete")):
+            _log_tts("[离线朗读] 使用随程序附带的 Melo 模型（无需联网）")
+            return bundled
     _log_tts("[离线朗读] 首次使用，正在下载 Melo 模型（约 190MB，需联网一次）")
     for rel in SHERPA_MELO_FILES:
         path = os.path.join(d, *rel.split("/"))
@@ -82,7 +97,7 @@ def _ensure_sherpa_model() -> str:
         for attempt in range(5):
             try:
                 req = urllib.request.Request(f"{SHERPA_MELO_BASE_URL}/{rel}", headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                with net_urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
                     while True:
                         chunk = resp.read(1 << 20)
                         if not chunk:
@@ -211,65 +226,84 @@ def reset_loudness_state():
 #      “谢谢，部长先生，那么……”这种，句首——对应“谢谢”两字——被模型吸掉，实测发现有些文本
 #      在按 speed 重试时甚至 100% 固定失败，说明这不是随机种子问题，而是文本本身触发的确定性 bug。
 # 对策略分两步：
-#   第 1~3 次重试：只扰动 speed（±15%，人耳难以察觉），对部分「真随机」失败有效且不改变听感。
-#   第 4 次起：若仍失败（说明是文本触发的固定性 bug，speed 扰动无效），改在文本前加一个有实际
-#      发音内容的语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
+#   第 1 次重试：只扰动 speed（±15%，人耳难以察觉），对「真随机」失败有效且不改变听感。
+#   第 2 次重试：若仍失败（说明是文本触发的固定性 bug），改在文本前加一个有实际发音内容的
+#      语气词前缀（实测“这个，”最有效，多个测试用例均能从 100%/67% 失败降到 0%），
 #      改变音素上下文来规避这个确定性缺陷。代价是听到一个多余的语气词开头，但远比关键内容完全丢失好。
 #      注意：纯标点（逗号/句号）完全无效，必须是实词，因为标点本身不产生音素。
-# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值设在 1e-4 足够可靠地区分。
-# 句首吸字样本句首段 rms 在 0.002~0.01，正常句首在 0.02 以上，阈值设在 0.015 区分。
+# 整句失败样本 rms 在 1e-6~1e-5 量级，正常样本（即使是轻音字）在 1e-3 以上，阈值 1e-4 足够区分。
+#
+# 句首吞字的判据【2026-10-21 修改】：从绝对阈值 head_rms < 0.015 改为相对占比。
+# 原因：Melo 正常发音带 ~50~250ms 起音淡入，加上擦音/鼻音起头（“世上/掍着/满/将军/谢谢”），
+# 实测正常句子的 head_rms 落在 0.005~0.017，与真·吞字（0.0027）区间重叠 → 大量误判。
+# 误判的代价是每次白跑 3~8 次重合成（实测单句 10~40 秒），听感上就是“读着读着长时间静音”。
+# 改判「前 250ms 能量占整句能量的比例」：
+#   正常句实测 22 个样本：0.147~0.565
+#   真·吞字（“谢谢，部长先生…” 那次提交的复现用例）：0.084
+# 阈值 0.12 能把两者分开，且不依赖录音电平（换音色/音量都成立）。
 SHERPA_SILENT_RMS_THRESHOLD = 0.0001
-SHERPA_HEAD_WINDOW_SEC = 0.25         # 检测句首吸字的窗口长度（秒）
-SHERPA_HEAD_RMS_THRESHOLD = 0.015     # 句首窗口 RMS 低于此值视为可能吸字
-SHERPA_SILENT_RETRY = 8               # 最多重试次数
-SHERPA_SILENT_SPEED_JITTER = 0.15     # 每次重试对 speed 的最大随机扰动幅度（按比例）
-SHERPA_SPEED_ONLY_RETRY = 3           # 前几次重试只扰动 speed，超过这个次数还失败才改加前缀文本
-SHERPA_FALLBACK_PREFIX = "这个，"      # 触发文本本身的确定性失败时，用这个语气词前缀规避
+SHERPA_HEAD_WINDOW_SEC = 0.25               # 检测句首吞字的窗口长度（秒）
+SHERPA_HEAD_RATIO_THRESHOLD = 0.12          # 句首 250ms 能量 / 整句能量 低于此值视为吞噬
+SHERPA_SILENT_RETRY = 8                     # 整句伪静音的预算：多是单字/短句（单次 1~3s），多试几次代价小
+SHERPA_HEAD_RETRY = 2                       # 句首吞字的预算：多是长句（单次 9~12s），多试一次就是十几秒静音
+SHERPA_SILENT_SPEED_JITTER = 0.15           # 每次重试对 speed 的最大随机扰动幅度（按比例）
+SHERPA_SPEED_ONLY_RETRY = 3                 # 整句伪静音：前 3 次只扰动 speed，再失败才加前缀
+SHERPA_HEAD_PREFIX_AT = 1                   # 句首吞字：第 2 次直接用前缀（speed 扰动对它无效）
+SHERPA_FALLBACK_PREFIX = "这个，"            # 触发文本本身的确定性失败时，用这个语气词前缀规避
 
 def _sherpa_detect_bad(g, text):
-    """检测一次 Melo 生成结果是否命中上述两种已知缺陷之一。返回 (is_bad, 诊断信息)。"""
+    """检测一次 Melo 生成结果是否命中已知缺陷。返回 (is_bad, 诊断信息, 类型)。
+    类型为 "silent"（整句伪静音）或 "head"（句首吞字），两种缺陷的重试预算不同。"""
     import numpy as np
     samples = np.asarray(g.samples, dtype=np.float64)
     if not samples.size:
-        return True, "empty"
+        return True, "empty", "silent"
     overall_rms = float(np.sqrt(np.mean(samples ** 2)))
     if overall_rms < SHERPA_SILENT_RMS_THRESHOLD and len(text) > 1:
-        return True, f"整句伪静音 rms={overall_rms:.6f}"
+        return True, f"整句伪静音 rms={overall_rms:.6f}", "silent"
     head_n = int(g.sample_rate * SHERPA_HEAD_WINDOW_SEC)
     if len(samples) > head_n * 2:   # 句子至少要比检测窗口长很多，避免短句被误判
         head_rms = float(np.sqrt(np.mean(samples[:head_n] ** 2)))
-        if head_rms < SHERPA_HEAD_RMS_THRESHOLD and overall_rms >= SHERPA_SILENT_RMS_THRESHOLD:
-            return True, f"句首吸字 head_rms={head_rms:.5f}（整句rms={overall_rms:.5f}）"
-    return False, ""
+        ratio = head_rms / max(overall_rms, 1e-9)
+        if ratio < SHERPA_HEAD_RATIO_THRESHOLD:
+            return True, f"句首能量占比过低 head/整句={ratio:.3f}（head_rms={head_rms:.5f}）", "head"
+    return False, "", ""
 
 def synthesize_tts_sherpa(text: str, rate: str) -> bytes:
     """离线合成（Sherpa-ONNX Melo，中英混读），返回 wav 字节。
-    对整句伪静音/句首吸字两种已知缺陷做重试保护（详见前面长注释）：
-    先扰动 speed 重试，仍失败则换成加前缀文本重试，全部用尽仍失败则返回短暂静音。"""
+
+    对两种已知缺陷做重试保护（详见前面长注释），但两者预算分开：
+      - 整句伪静音（多为单字/短句，单次 1~3s）→ 最多 8 次，前 3 次只扰动 speed；
+      - 句首吞字（多为长句，单次 9~12s）→ 最多 2 次，第 2 次直接加前缀。
+    长句多试几次的代价是十几秒静音，比“偶尔吞一个字”更伤体验，所以句首类快速止血。"""
     import numpy as np
     import random
     base_speed = _rate_to_speed(rate)
     speed = base_speed
     g = None
-    is_bad, reason = True, ""
+    is_bad, reason, kind = True, "", "silent"
     used_prefix = False
-    for attempt in range(SHERPA_SILENT_RETRY):
-        cur_text = text
-        if attempt >= SHERPA_SPEED_ONLY_RETRY:
-            cur_text = SHERPA_FALLBACK_PREFIX + text   # speed 扰动无效时，改加前缀改变音素上下文
-            used_prefix = True
+    attempt = 0
+    while True:
+        budget = SHERPA_SILENT_RETRY if kind == "silent" else SHERPA_HEAD_RETRY
+        prefix_at = SHERPA_SPEED_ONLY_RETRY if kind == "silent" else SHERPA_HEAD_PREFIX_AT
+        cur_text = SHERPA_FALLBACK_PREFIX + text if attempt >= prefix_at else text
+        used_prefix = attempt >= prefix_at
         with _sherpa_lock:
             tts = _load_sherpa_tts()
             g = tts.generate(cur_text, sid=0, speed=speed)
         if not len(g.samples):
             raise RuntimeError("Melo 未返回音频")
-        is_bad, reason = _sherpa_detect_bad(g, cur_text)
+        is_bad, reason, kind = _sherpa_detect_bad(g, cur_text)
         if not is_bad:
             break
         _log_tts(f"[Melo重试] {reason}（第{attempt + 1}次{'，已加前缀' if used_prefix else ''}）：{text[:30]!r}")
+        attempt += 1
+        if attempt >= budget:      # 该类缺陷的预算用尽 → 不再硬试
+            break
         speed = base_speed * (1.0 + random.uniform(-SHERPA_SILENT_SPEED_JITTER, SHERPA_SILENT_SPEED_JITTER))
     if is_bad:
-        _log_tts(f"[Melo重试失败] 重试{SHERPA_SILENT_RETRY}次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
+        _log_tts(f"[Melo重试失败] {attempt} 次仍异常（{reason}），改返回短暂静音：{text[:30]!r}")
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
@@ -295,7 +329,11 @@ _kokoro_tts = None
 _kokoro_lock = threading.Lock()   # 同时保护模型加载和合成调用
 
 def kokoro_model_ready() -> bool:
-    return os.path.isfile(os.path.join(APP_DIR, "sherpa_models", KOKORO_DIR, ".complete"))
+    dirs = [os.path.join(APP_DIR, "sherpa_models", KOKORO_DIR)]
+    b = bundled_models_dir()
+    if b:
+        dirs.append(os.path.join(b, "sherpa_models", KOKORO_DIR))
+    return any(os.path.isfile(os.path.join(d, ".complete")) for d in dirs)
 
 def _ensure_kokoro_model() -> str:
     """确保 Kokoro 模型文件齐全（int8 量化版约 140MB，首次需联网），返回模型目录。"""
@@ -304,6 +342,12 @@ def _ensure_kokoro_model() -> str:
     ok_flag = os.path.join(d, ".complete")
     if os.path.isfile(ok_flag):
         return d
+    b = bundled_models_dir()
+    if b:
+        bundled = os.path.join(b, "sherpa_models", KOKORO_DIR)
+        if os.path.isfile(os.path.join(bundled, ".complete")):
+            _log_tts("[离线朗读] 使用随程序附带的 Kokoro 模型（无需联网）")
+            return bundled
     _log_tts("[离线朗读] 首次使用，正在下载 Kokoro 模型（约 140MB，需联网一次）")
     os.makedirs(base, exist_ok=True)
     tmp = os.path.join(base, KOKORO_DIR + ".tar.bz2.part")
@@ -311,7 +355,7 @@ def _ensure_kokoro_model() -> str:
     for attempt in range(5):
         try:
             req = urllib.request.Request(KOKORO_URL, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+            with net_urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
                 while True:
                     chunk = resp.read(1 << 20)
                     if not chunk:
@@ -405,6 +449,13 @@ def _ensure_piper_model(voice_id: str) -> str:
     onnx_path = os.path.join(d, f"{voice_id}.onnx")
     cfg_path = onnx_path + ".json"
     prefix = PIPER_VOICES[voice_id]
+    # 优先使用随程序附带的模型（U 盘/安装包一体分发，无需联网）
+    b = bundled_models_dir()
+    if b:
+        bundled_onnx = os.path.join(b, "piper_models", f"{voice_id}.onnx")
+        bundled_cfg = bundled_onnx + ".json"
+        if os.path.isfile(bundled_onnx) and os.path.isfile(bundled_cfg):
+            return bundled_onnx
     if not (os.path.isfile(onnx_path) and os.path.isfile(cfg_path)):
         _log_tts(f"[离线朗读] 首次使用，正在下载模型：{voice_id}（约 60MB，需联网一次）")
         for path, url in ((onnx_path, f"{PIPER_MODEL_BASE_URL}/{prefix}/{voice_id}.onnx"),
@@ -412,7 +463,7 @@ def _ensure_piper_model(voice_id: str) -> str:
             tmp = path + ".part"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                with net_urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
                     out.write(resp.read())
                 os.replace(tmp, path)
             except Exception as e:
@@ -580,6 +631,79 @@ def _azure_usage_add(idx: int, text: str):
 class _AzureAccountError(Exception):
     """账号级错误（认证失败 / 额度用尽 / 持续限流），应切换到下一个账号。"""
 
+# Azure 输出格式：用 48kbps mp3（≈ 6KB/s）而不是 24kHz PCM（48KB/s）。
+# 起因：2026-10-17 为了修“新播放器放不了 mp3”把格式改成 riff-24khz-16bit-mono-pcm，
+# 代价是每句要传的数据量×8（实测同一句57字：mp3 86KB vs WAV 689KB）。而本机到
+# eastus 的链路在传输 ~100KB / 6~10 秒时会被重置（IncompleteRead），于是长句全部
+# 被掐在句首→3 次重试全废→整句跳过→整章无声。改用 mp3 再本地解码成 PCM，
+# 既能躲开该窗口，播放层仍然只处理 WAV/PCM（不需要改 TtsPlayer）。
+AZURE_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
+AZURE_PCM_RATE = 24000
+# 链路被掐断时，已经收到的 mp3 仍然能解出前段音频（mp3 可流式解码），
+# 宁可句尾缺几个字，也好过整句被跳过完全没声音。
+AZURE_SALVAGE_MIN_BYTES = 4096
+
+
+def _pcm_to_wav(pcm: bytes, sample_rate: int = AZURE_PCM_RATE) -> bytes:
+    """把单声道 int16 PCM 打包成 wav 字节（与 TtsPlayer 期望的格式一致）。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _mp3_to_wav(data: bytes, sample_rate: int = AZURE_PCM_RATE) -> bytes:
+    """用 Qt 的 QAudioDecoder 把 mp3 解成单声道 int16 PCM（再包成 wav）。
+
+    调用方可能处于普通 Python 工作线程（TtsWorker），因此这里自建一个 QEventLoop
+    等待解码完成；QAudioDecoder 只在该线程内创建和使用，不跨线程。"""
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QEventLoop, QTimer
+    from PySide6.QtMultimedia import QAudioDecoder, QAudioFormat
+
+    if not data:
+        raise RuntimeError("空的 mp3 数据")
+    src = QBuffer()
+    src.setData(QByteArray(data))
+    src.open(QIODevice.OpenModeFlag.ReadOnly)
+    dec = QAudioDecoder()
+    fmt = QAudioFormat()
+    fmt.setSampleRate(sample_rate)
+    fmt.setChannelCount(1)
+    fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+    dec.setAudioFormat(fmt)      # 强制解成播放层想要的格式，后续不需要重采样
+    dec.setSourceDevice(src)
+
+    pcm = bytearray()
+    loop = QEventLoop()
+
+    def _drain():
+        b = dec.read()
+        if b.isValid():
+            pcm.extend(bytes(b.constData()))
+
+    dec.bufferReady.connect(_drain)
+    dec.finished.connect(loop.quit)
+    dec.error.connect(lambda _e: loop.quit())
+    guard = QTimer()                     # 解码卡住时保底退出（用完显式 stop，避免回调悬空）
+    guard.setSingleShot(True)
+    guard.timeout.connect(loop.quit)
+    guard.start(30_000)
+    dec.start()
+    loop.exec()
+    guard.stop()
+    try:
+        _drain()                             # 收尾：最后一块
+        dec.stop()
+    except Exception:
+        pass
+    if not pcm:
+        raise RuntimeError(f"mp3 解码失败（{dec.errorString() or '无 PCM 输出'}）")
+    return _pcm_to_wav(bytes(pcm), sample_rate)
+
+
 def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> bytes:
     import re
     import urllib.error
@@ -592,21 +716,35 @@ def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> 
             f"<voice name='{voice_name}'><prosody rate='{rate}'>{escape(text)}</prosody></voice></speak>")
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/ssml+xml",
-               "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm", "User-Agent": "PyReader"}
+               "X-Microsoft-OutputFormat": AZURE_OUTPUT_FORMAT, "User-Agent": "PyReader"}
     last_err = None
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, data=ssml.encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with net_urlopen(req, timeout=30) as resp:
                 data = resp.read()
             if not data:
                 raise RuntimeError("Azure 未返回音频")
             _azure_usage_add(idx, text)
-            return data
+            return _mp3_to_wav(data)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 raise _AzureAccountError(f"认证失败或额度用尽（HTTP {e.code}）") from e
             last_err = e
+        except http.client.IncompleteRead as e:
+            # 链路在传输中途被掐断：已收到的 mp3 前缀仍可解码，直接用它，避免整句丢失
+            partial = e.partial or b""
+            if len(partial) >= AZURE_SALVAGE_MIN_BYTES:
+                try:
+                    wav = _mp3_to_wav(partial)
+                    _azure_usage_add(idx, text)
+                    _log_tts(f"[Azure截断] 只收到 {len(partial)}B（第{attempt + 1}次），"
+                             f"用已收到的前段音频代替（句尾可能缺几个字）：{text[:30]!r}")
+                    return wav
+                except Exception as e2:
+                    last_err = e2
+            else:
+                last_err = e
         except Exception as e:
             last_err = e
         _log_tts(f"[Azure重试] 账号{idx} 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{last_err}")
@@ -615,10 +753,11 @@ def _azure_call(idx: int, acct: dict, voice_name: str, text: str, rate: str) -> 
         raise _AzureAccountError("持续被限流（HTTP 429）") from last_err
     raise RuntimeError(f"Azure 语音合成失败（已重试3次）：{last_err}")
 
-def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
-    """Azure Speech 云端合成，返回 mp3 字节。主账号认证失败/额度用尽/持续限流时自动切换备用账号，
-    出问题的账号会被暂时跳过一段时间，避免每句都先撞一次错误。所有账号都不可用时，
-    自动回退到 edge-tts（同样的 Neural 音色名，免费但偶发因微软接口变更而失效，仅作补充）。"""
+def _azure_synthesize_once(text: str, voice_name: str, rate: str) -> bytes:
+    """单次 Azure 合成（含账号切换 / edge-tts 回退），返回 wav 字节。
+    主账号认证失败/额度用尽/持续限流时自动切换备用账号，出问题的账号会被暂时跳过一段时间，
+    避免每句都先撞一次错误。所有账号都不可用时，自动回退到 edge-tts
+    （同样的 Neural 音色名，免费但偶发因微软接口变更而失效，仅作补充；它的 mp3 也会同样解码成 wav）。"""
     accts = [dict(a) for a in _azure_accounts]
     if not accts[0]["key"]:
         accts[0] = {"key": os.environ.get("AZURE_SPEECH_KEY", "").strip(),
@@ -639,10 +778,77 @@ def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
                 errors.append(f"账号{i}：{e}")
     try:
         _log_tts(f"[Azure] 所有账号不可用，回退到 edge-tts（{voice_name}）")
-        return synthesize_tts_edge(text, voice_name, rate)
+        return _mp3_to_wav(synthesize_tts_edge(text, voice_name, rate))   # edge-tts 返回 mp3，同样解码成 wav
     except Exception as e:
         errors.append(f"edge-tts 回退也失败：{e}")
     raise RuntimeError("Azure Speech 所有账号均不可用，edge-tts 回退也失败（" + "；".join(errors) + "）")
+
+
+# Azure 长文本切块：本机到 eastus 的链路会在传输 ~100KB 时被重置，而 mp3 约 6KB/s，
+# 也就是单个连接大约只能传完 14~16 秒音频。超过 40 字的句子切块合成，
+# 单块响应落在窗口内；即使某块被掐断（IncompleteRead），损失也只限于那一块的后半句，
+# 不会像以前那样整句被跳过导致整章无声。
+AZURE_CHUNK_CHARS = 40
+AZURE_CHUNK_BREAKS = "， 。、； ： ！ ？ ,.!?;:"
+
+
+def _split_for_azure(text: str, limit: int = AZURE_CHUNK_CHARS):
+    """按标点把长句切成 ≤limit 字的块（找不到标点就硬切），保留原文顺序与标点。"""
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks, cur = [], ""
+    for ch in text:
+        cur += ch
+        if len(cur) >= limit and ch in AZURE_CHUNK_BREAKS:
+            chunks.append(cur); cur = ""
+    if cur:
+        chunks.append(cur)
+    # 某块仍超长（整段没有标点）→ 硬切
+    out = []
+    for c in chunks:
+        while len(c) > limit * 2:
+            out.append(c[:limit]); c = c[limit:]
+        if c.strip():
+            out.append(c)
+    return out
+
+
+def synthesize_tts_azure(text: str, voice_name: str, rate: str) -> bytes:
+    """Azure Speech 云端合成，返回 wav 字节（内部拿 mp3 再本地解码成 PCM，见 _mp3_to_wav）。
+
+    长句会先切块再逐块合成，最后把 PCM 拼成一条音频（同采样率同格式，拼接无缝）。
+    单块失败不会拖垮整句：用已成功的块继续，只缺那一块。"""
+    chunks = _split_for_azure(text)
+    if not chunks:
+        # 归一化后只剩空白（纯标点/引号）：返回一段极短静音，不要抛错中断整章朗读
+        return _pcm_to_wav(b"\x00\x00" * (AZURE_PCM_RATE // 100), AZURE_PCM_RATE)
+    if len(chunks) == 1:
+        return _azure_synthesize_once(chunks[0], voice_name, rate)
+
+    pcm = bytearray()
+    rate_hz = None
+    failed = 0
+    for i, part in enumerate(chunks):
+        try:
+            wav = _azure_synthesize_once(part, voice_name, rate)
+        except Exception as e:
+            failed += 1
+            _log_tts(f"[Azure分块] 第{i + 1}/{len(chunks)}块失败，跳过：{e}（{part[:20]!r}）")
+            continue
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+            data = w.readframes(w.getnframes())
+        if sr != AZURE_PCM_RATE or ch != 1 or sw != 2:
+            # 罕见：解码器返回的格式不是预期的 24kHz/mono/int16 → 不做拼接，直接返回该块
+            return wav
+        rate_hz = sr
+        pcm += data
+    if not pcm:
+        raise RuntimeError(f"Azure 分块合成都失败（{failed}/{len(chunks)} 块）")
+    if failed:
+        _log_tts(f"[Azure分块] {len(chunks)} 块中 {failed} 块失败，其余已拼接")
+    return _pcm_to_wav(bytes(pcm), rate_hz or AZURE_PCM_RATE)
 
 _edge_tts_skip_until = 0.0   # edge-tts 端点被封/403 后，暂时跳过的截止时间（秒级时间戳），避免每句都先撞一次错误
 EDGE_TTS_SKIP_SECONDS = 600
@@ -742,7 +948,7 @@ def _log_tts(msg):
         pass
 
 class TtsWorker(QObject):
-    ready = Signal(int, bytes)     # (句子序号, mp3 字节)
+    ready = Signal(int, bytes)     # (句子序号, 音频字节；Azure/edge-tts 已解码为 wav，离线引擎本来就是 wav)
     failed = Signal(int, str)      # (句子序号, 错误信息)
     def __init__(self, seq, text, voice, rate):
         super().__init__()
