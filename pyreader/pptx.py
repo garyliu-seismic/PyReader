@@ -81,6 +81,61 @@ def _iter_shapes(shapes):
             yield sh
 
 
+def _bg_state(owner):
+    """读取幻灯片/版式/母版的背景。返回 None（未声明，继续继承）、
+    "other"（纯色/渐变/无填充等，非图片，停止继承）或 (key, blob)（图片背景）。"""
+    from pptx.oxml.ns import qn
+    bg = owner._element.find(qn("p:cSld") + "/" + qn("p:bg"))
+    if bg is None:
+        return None
+    part = owner.part
+    emb = qn("r:embed")
+    pr = bg.find(qn("p:bgPr"))
+    if pr is not None:
+        blip = pr.find(qn("a:blipFill") + "/" + qn("a:blip"))
+        if blip is None:
+            return "other"
+        rid = blip.get(emb)
+        try:
+            ip = part.related_part(rid)
+            return (str(ip.partname), ip.blob)
+        except Exception:
+            return "other"
+    ref = bg.find(qn("p:bgRef"))
+    if ref is not None:
+        try:
+            idx = int(ref.get("idx", "0"))
+            if idx < 1001:
+                return "other"           # 引用 fillStyleLst / 无填充：忽略
+            from lxml import etree
+            from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+            master = owner if owner.part.partname.find("slideMaster") >= 0 else                 getattr(owner, "slide_master", None)
+            mpart = master.part
+            tpart = mpart.part_related_by(RT.THEME)
+            root = etree.fromstring(tpart.blob)
+            lst = root.find(".//" + qn("a:bgFillStyleLst"))
+            fill = list(lst)[idx - 1001]
+            if fill.tag != qn("a:blipFill"):
+                return "other"
+            blip = fill.find(qn("a:blip"))
+            ip = tpart.related_part(blip.get(emb))
+            return (str(ip.partname), ip.blob)
+        except Exception:
+            return "other"
+    return "other"
+
+
+def _slide_bg_image(slide):
+    """slide → layout → master，第一个声明了背景的决定结果；仅图片返回 (key, blob)。"""
+    layout = slide.slide_layout
+    for owner in (slide, layout, layout.slide_master):
+        st = _bg_state(owner)
+        if st is None:
+            continue
+        return None if st == "other" else st
+    return None
+
+
 def load_pptx(path, progress=None):
     """解析 PPTX → (全文, 章节, 书名, extra)；extra = {"blocks": [...], "images": {...}}。"""
     try:
@@ -132,15 +187,24 @@ def load_pptx(path, progress=None):
         blocks.append({"type": "table", "start": start, "cells": cells, "align": []})
         offset += len(txt) + 1
 
-    def emit_picture(shape):
+    bg_ids = {}   # 背景图 key(partname) → img_id，共享的版式/母版背景只存一份
+
+    def emit_picture(shape=None, blob=None, key=None):
         nonlocal img_counter
-        try:
-            blob = shape.image.blob
-        except Exception:
-            return
-        img_id = f"pptx_img_{img_counter}"
-        img_counter += 1
-        images[img_id] = blob
+        if blob is None:
+            try:
+                blob = shape.image.blob
+            except Exception:
+                return
+        if key is not None and key in bg_ids:
+            img_id = bg_ids[key]
+            blob = images[img_id]
+        else:
+            img_id = f"pptx_img_{img_counter}"
+            img_counter += 1
+            images[img_id] = blob
+            if key is not None:
+                bg_ids[key] = img_id
         w = h = 0
         try:
             from PIL import Image as PILImage
@@ -186,6 +250,12 @@ def load_pptx(path, progress=None):
         stitle = stitle or f"Slide {n}"
         start, _ = emit_text("heading", [(stitle, 0, offset, offset + len(stitle))], level=1)
         chapters.append((start, stitle))
+        try:
+            bg = _slide_bg_image(slide)
+        except Exception:
+            bg = None
+        if bg:
+            emit_picture(blob=bg[1], key=bg[0])
 
         for sh in shapes:
             if _is_title(sh):

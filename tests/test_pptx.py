@@ -129,3 +129,89 @@ def test_loader_dispatch(tmp_path):
     text, chapters, _title, extra = got["r"]
     assert [t for _, t in chapters][0] == "Intro"
     assert extra["blocks"] and NOTE not in text
+
+
+# ---------------- 背景填充 ----------------
+from lxml import etree
+from pptx.oxml.ns import qn
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+
+def _png_color(c):
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 6), c).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _set_pic_bg(owner, blob_bytes):
+    """给 slide / layout / master 设置图片背景（python-pptx 无 API，手写 XML）。"""
+    from pptx.parts.image import ImagePart
+    part = owner.part
+    img_part = ImagePart.new(part.package, __import__("pptx.parts.image", fromlist=["Image"]).Image.from_blob(blob_bytes))
+    rid = part.relate_to(img_part, RT.IMAGE)
+    csld = owner._element.find(qn("p:cSld"))
+    old = csld.find(qn("p:bg"))
+    if old is not None:
+        csld.remove(old)
+    bg = etree.fromstring(
+        '<p:bg xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<p:bgPr><a:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></a:blipFill>'
+        '<a:effectLst/></p:bgPr></p:bg>')
+    csld.insert(0, bg)
+
+
+def _set_solid_bg(owner):
+    s = owner.background.fill
+    s.solid()
+    from pptx.dml.color import RGBColor
+    s.fore_color.rgb = RGBColor(0, 0, 255)
+
+
+def _bg_blocks(extra):
+    return [b for b in extra["blocks"] if b["type"] == "image"]
+
+
+def test_bg_picture_on_slide_follows_heading(tmp_path):
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "T"
+    _set_pic_bg(s, _png_color((1, 2, 3)))
+    prs.save(str(tmp_path / "a.pptx"))
+    _, _, _, extra = load_pptx(str(tmp_path / "a.pptx"))
+    assert [b["type"] for b in extra["blocks"]] == ["heading", "image"]
+    assert extra["blocks"][1]["start"] == extra["blocks"][0]["start"] + 2
+    assert (extra["blocks"][1]["img_w"], extra["blocks"][1]["img_h"]) == (8, 6)
+
+
+def test_bg_inherited_from_layout_and_master_stored_once(tmp_path):
+    prs = Presentation()
+    lay = prs.slide_layouts[5]
+    _set_pic_bg(lay, _png_color((9, 9, 9)))
+    for i in range(3):
+        prs.slides.add_slide(lay).shapes.title.text = f"L{i}"
+    m = prs.slide_layouts[6]            # 该版式无背景 → 继承母版
+    _set_pic_bg(prs.slide_master, _png_color((7, 7, 7)))
+    prs.slides.add_slide(m)
+    prs.save(str(tmp_path / "b.pptx"))
+    _, _, _, extra = load_pptx(str(tmp_path / "b.pptx"))
+    imgs = _bg_blocks(extra)
+    assert len(imgs) == 4                       # 每张幻灯片一个块
+    assert len(extra["images"]) == 2            # 版式图 + 母版图各存一份
+    assert len({b["img_id"] for b in imgs[:3]}) == 1
+
+
+def test_bg_solid_no_image_and_blocks_inheritance(tmp_path):
+    prs = Presentation()
+    lay = prs.slide_layouts[5]
+    _set_pic_bg(lay, _png_color((9, 9, 9)))
+    s = prs.slides.add_slide(lay)
+    s.shapes.title.text = "T"
+    _set_solid_bg(s)                            # 自身纯色覆盖继承的图片
+    s2 = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_solid_bg(s2)
+    prs.save(str(tmp_path / "c.pptx"))
+    _, _, _, extra = load_pptx(str(tmp_path / "c.pptx"))
+    assert _bg_blocks(extra) == [] and extra["images"] == {}
