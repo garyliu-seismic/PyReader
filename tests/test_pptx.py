@@ -215,3 +215,34 @@ def test_bg_solid_no_image_and_blocks_inheritance(tmp_path):
     prs.save(str(tmp_path / "c.pptx"))
     _, _, _, extra = load_pptx(str(tmp_path / "c.pptx"))
     assert _bg_blocks(extra) == [] and extra["images"] == {}
+
+
+# ---------------- 仅图片背景的幻灯片 ----------------
+def _image_only_deck(tmp_path):
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Before"
+    s2 = prs.slides.add_slide(prs.slide_layouts[6])      # 无标题无形状，仅背景图
+    _set_pic_bg(s2, _png_color((5, 5, 5)))
+    s3 = prs.slides.add_slide(prs.slide_layouts[5])
+    s3.shapes.title.text = "After"
+    _set_pic_bg(s3, _png_color((6, 6, 6)))               # 有标题 + 背景图，其后无文字
+    prs.save(str(tmp_path / "io.pptx"))
+    return load_pptx(str(tmp_path / "io.pptx"))
+
+
+def test_image_only_slide_no_visible_heading(tmp_path):
+    text, chapters, _, extra = _image_only_deck(tmp_path)
+    assert "Slide 2" not in text
+    assert [t for _, t in chapters] == ["Before", "Slide 2", "After"]
+    blocks = extra["blocks"]
+    assert [b["type"] for b in blocks] == ["heading", "image", "heading", "image"]
+    # 图片块属于自己的幻灯片：恰好落在该章节范围内，而不是下一章的起点
+    assert chapters[1][0] == blocks[1]["start"]
+    assert chapters[1][0] <= blocks[1]["start"] < chapters[2][0]
+    assert chapters[2][0] <= blocks[3]["start"] < len(text)
+    assert text[blocks[1]["start"]] == "\n"
+    # 图片占 1 个字符：块 start 单调递增且互不相同
+    starts = [b["start"] for b in blocks]
+    assert starts == sorted(set(starts))
+    assert chapters[0][0] == 0 and text.startswith("Before\n")

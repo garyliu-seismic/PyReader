@@ -190,7 +190,7 @@ def load_pptx(path, progress=None):
     bg_ids = {}   # 背景图 key(partname) → img_id，共享的版式/母版背景只存一份
 
     def emit_picture(shape=None, blob=None, key=None):
-        nonlocal img_counter
+        nonlocal img_counter, offset
         if blob is None:
             try:
                 blob = shape.image.blob
@@ -212,8 +212,12 @@ def load_pptx(path, progress=None):
                 w, h = im.size
         except Exception:
             pass
+        # 图片占 1 个字符偏移（换行符，TTS/搜索视为空白），否则 start 会与下一块
+        # （常是下一张幻灯片的标题）相同，渲染时被归入下一章。
         blocks.append({"type": "image", "start": offset, "img_id": img_id,
                        "img_w": w, "img_h": h})
+        text_parts.append(chr(10))
+        offset += 1
 
     def emit_text_frame(shape):
         ph = _ph_type(shape)
@@ -247,7 +251,9 @@ def load_pptx(path, progress=None):
                 stitle = " ".join(s.text_frame.text.replace("\x0b", " ").split())
                 if stitle:
                     break
+        fallback = not stitle
         stitle = stitle or f"Slide {n}"
+        h_idx, h_parts = len(blocks), len(text_parts)
         start, _ = emit_text("heading", [(stitle, 0, offset, offset + len(stitle))], level=1)
         chapters.append((start, stitle))
         try:
@@ -266,6 +272,16 @@ def load_pptx(path, progress=None):
                 emit_picture(sh)
             elif sh.has_text_frame:
                 emit_text_frame(sh)
+        # 无标题且只有图片（如整页背景图）：去掉 "Slide N" 标题块，章节挂在首张图片上，
+        # 避免朗读/显示无意义的 "Slide N"。
+        rest = blocks[h_idx + 1:]
+        if fallback and rest and all(b["type"] == "image" for b in rest):
+            shift = len(stitle) + 1
+            del blocks[h_idx]
+            del text_parts[h_parts:h_parts + 2]
+            for b in blocks[h_idx:]:
+                b["start"] -= shift
+            offset -= shift
         if progress:
             progress(5 + int(90 * n / total), f"解析第 {n} 页…")
 
