@@ -20,6 +20,10 @@ tmp_ret = collect_all('PIL')      # 3D 翻页透视扭曲
 binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numpy')    # 快照转数组
 binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('winsdk')   # Windows 系统语音（WinRT SpeechSynthesizer，离线）
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('comtypes')   # SAPI5 语音（NaturalVoiceSAPIAdapter 桥接的自然语音）
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # ---- 未用到的 Qt 模块（排除后可省几百 MB）----
 # 应用只用 QtWidgets + QtGui + QtCore + QtMultimedia + QtNetwork。
@@ -85,6 +89,17 @@ def _drop_qt_dll(name: str) -> bool:
     return base.startswith(_DROP_DLL_PREFIXES) or base in _DROP_DLL_NAMES
 
 a.binaries = [b for b in a.binaries if not _drop_qt_dll(b[0])]
+
+# ---- 自检：播放器（有声书 QMediaPlayer）与朗读（QAudioSink）都靠 Qt Multimedia 的 ffmpeg 后端 ----
+# Qt6Multimedia / Qt6Network 与 FFmpeg DLL、plugins/multimedia/ffmpegmediaplugin.dll 缺任何一个，包里就「能启动但放不出声」，
+# 而且只有在用户机器上才会发现；上面的前缀过滤误伤（例如以后给 'Qt6Multimedia' 加了前缀）时让构建直接失败。
+_NEED_BINARIES = ('Qt6Multimedia.dll', 'Qt6Network.dll', 'ffmpegmediaplugin.dll')
+_NEED_PREFIXES = ('avcodec', 'avformat', 'avutil', 'swresample', 'swscale')
+_have = [os.path.basename(b[0]) for b in a.binaries]
+_missing = ([n for n in _NEED_BINARIES if n not in _have]
+            + [p for p in _NEED_PREFIXES if not any(h.startswith(p) for h in _have)])
+if _missing:
+    raise SystemExit('PyReader.spec: 音频播放需要的 Qt Multimedia / FFmpeg 文件被剔除或没被收集：' + ', '.join(_missing))
 
 # ---- 过滤 Qt 多语言翻译 / QML / WebEngine 资源（应用为中文，无需 186 种翻译）----
 def _drop_qt_data(name: str) -> bool:
